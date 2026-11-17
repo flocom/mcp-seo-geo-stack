@@ -70,3 +70,24 @@ jobs:
           path: |
             e2e-logs.txt
             updater-e2e-logs.txt
+
+  # Same updater test with Docker's containerd image store (default on new Docker installs),
+  # where image IDs and pruning behave differently from the classic overlay2 store.
+  updater-containerd:
+    runs-on: ubuntu-24.04-arm
+    needs: [lint, setup-flow]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Enable the containerd image store
+        run: |
+          echo '{"features": {"containerd-snapshotter": true}}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          docker info -f '{{.DriverStatus}}'
+      - name: Automatic updates (updater service, containerd store)
+        run: bash tests/updater-e2e.sh
+      - name: Container logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: updater-containerd-logs
+          path: updater-e2e-logs.txt
