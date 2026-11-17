@@ -8,7 +8,8 @@
 # merged Renovate PR would, and checks that:
 #   - the startup deployment is a no-op (no container recreated);
 #   - a new commit is fetched, fast-forwarded and deployed within a few seconds: changed services
-#     are recreated, including the updater itself, and the data volume is kept;
+#     are recreated, including the updater itself with its rebuilt image, and the data volume is kept;
+#   - the rebuilt updater can deploy the following commits (its previous image has been pruned);
 #   - a broken commit does not take the running stack down, and the next good commit is deployed;
 #   - the checkout stays owned by its user (git never runs as root), and no helper container is left.
 set -euo pipefail
@@ -91,6 +92,8 @@ for svc in ("setup", "updater"):
     s = s.replace(line, line + '    labels: {e2e.revision: "2"}\n', 1)
 open(p, "w").write(s)
 PY
+# Also change the updater's own code, so that its image is rebuilt and the old one pruned.
+printf '# e2e-v2\n' >> "$DEV/services/updater/updater.sh"
 v2=$(push_dev v2)
 until_ok 240 server_at "$v2" || fail "server checkout was not fast-forwarded to v2"
 ok "server checkout fast-forwarded to the new commit"
@@ -98,6 +101,8 @@ until_ok 240 labels_are 2 || fail "services were not redeployed with v2"
 [[ "$(cid setup)" != "$setup_before" ]] || fail "setup was not recreated"
 ok "changed services recreated, including the updater itself"
 until_ok 120 deployed "$v2" || fail "new updater did not report v2"
+dc exec -T updater grep -q e2e-v2 /usr/local/bin/updater || fail "updater still runs its old image"
+ok "updater runs its rebuilt image"
 dc exec -T setup cat /data/e2e-marker | grep -q keep || fail "data volume lost"
 ok "data volume kept across the update"
 
