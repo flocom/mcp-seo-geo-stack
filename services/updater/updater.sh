@@ -111,7 +111,10 @@ watch_loop() {
     log "ce service doit être lancé par docker compose"
     exit 1
   fi
-  image=$(self_inspect '{{.Image}}')
+  # Par son nom, pas par son identifiant : avec le stockage d'images containerd, chaque
+  # reconstruction change l'identifiant et le nettoyage supprime l'ancienne image, même si ce
+  # conteneur tourne encore dessus (« No such image » au déploiement suivant).
+  image=$(self_inspect '{{.Config.Image}}')
   socket=$(self_inspect '{{range .Mounts}}{{if eq .Destination "/var/run/docker.sock"}}{{.Source}}{{end}}{{end}}')
   # git tourne avec l'uid du propriétaire du dépôt : aucun fichier root dans le clone.
   owner=$(stat -c %u:%g /repo)
