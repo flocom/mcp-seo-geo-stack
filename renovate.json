@@ -1,0 +1,79 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommitTypeAll(chore)"
+  ],
+  "timezone": "Europe/Paris",
+  "dependencyDashboard": true,
+  "labels": [
+    "dependencies"
+  ],
+  "enabledManagers": [
+    "npm",
+    "pip_requirements",
+    "dockerfile",
+    "docker-compose",
+    "github-actions"
+  ],
+  "rangeStrategy": "pin",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": [
+      "before 6am on monday"
+    ]
+  },
+  "packageRules": [
+    {
+      "description": "Serveurs MCP : une PR dédiée par paquet, jamais groupée",
+      "matchPackageNames": [
+        "search-console-mcp",
+        "analytics-mcp"
+      ],
+      "labels": [
+        "dependencies",
+        "mcp-server"
+      ]
+    },
+    {
+      "description": "supergateway est présent dans deux services : une seule PR",
+      "matchPackageNames": [
+        "supergateway"
+      ],
+      "groupName": "supergateway"
+    },
+    {
+      "description": "Images de base : grouper les mises à jour mineures et correctives",
+      "matchManagers": [
+        "dockerfile",
+        "docker-compose"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "digest"
+      ],
+      "groupName": "images de base"
+    },
+    {
+      "description": "Pas de saut de version majeure de Node ou Python sans intervention manuelle",
+      "matchManagers": [
+        "dockerfile"
+      ],
+      "matchPackageNames": [
+        "node",
+        "python"
+      ],
+      "matchUpdateTypes": [
+        "major"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "groupName": "GitHub Actions"
+    }
+  ]
+}

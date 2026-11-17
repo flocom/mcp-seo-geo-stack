@@ -1,0 +1,11 @@
+# Override used by tests/e2e.sh only: exposes the services on localhost
+# so the test can reach them, and keeps cloudflared out (no real tunnel token).
+services:
+  setup:
+    ports: ["127.0.0.1:18080:8080"]
+  gsc-bing:
+    ports: ["127.0.0.1:18001:8000"]
+  ga4:
+    ports: ["127.0.0.1:18002:8000"]
+  cloudflared:
+    profiles: ["tunnel"]

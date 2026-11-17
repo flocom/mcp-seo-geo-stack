@@ -1,0 +1,70 @@
+# mcp-seo-geo-stack : connecteur Claude privé (Search Console + Bing Webmaster + GA4)
+# publié via un tunnel Cloudflare. Aucun port n'est ouvert sur le serveur.
+#
+#   docker compose up -d            # construit les images arm64 localement si besoin
+#   docker compose pull && docker compose up -d   # avec IMAGE_PREFIX=ghcr.io/flocom/mcp-seo-geo-stack
+name: mcp-seo-geo-stack
+
+x-service: &service
+  platform: linux/arm64
+  restart: unless-stopped
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  tmpfs: ["/tmp:size=128m,mode=1777"]
+  networks: [mcp]
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  setup:
+    <<: *service
+    build:
+      context: .
+      dockerfile: services/setup/Dockerfile
+      platforms: [linux/arm64]
+    image: ${IMAGE_PREFIX:-mcp-seo-geo-stack}/setup:${IMAGE_TAG:-latest}
+    volumes:
+      - seo-data:/data
+
+  gsc-bing:
+    <<: *service
+    build:
+      context: .
+      dockerfile: services/gsc-bing/Dockerfile
+      platforms: [linux/arm64]
+    image: ${IMAGE_PREFIX:-mcp-seo-geo-stack}/gsc-bing:${IMAGE_TAG:-latest}
+    volumes:
+      - seo-data:/data:ro
+    depends_on: [setup]
+
+  ga4:
+    <<: *service
+    build:
+      context: .
+      dockerfile: services/ga4/Dockerfile
+      platforms: [linux/arm64]
+    image: ${IMAGE_PREFIX:-mcp-seo-geo-stack}/ga4:${IMAGE_TAG:-latest}
+    volumes:
+      - seo-data:/data:ro
+    depends_on: [setup]
+
+  cloudflared:
+    <<: *service
+    image: cloudflare/cloudflared:2026.11.0
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?Renseignez CLOUDFLARE_TUNNEL_TOKEN dans .env}
+    depends_on:
+      setup:
+        condition: service_healthy
+
+networks:
+  mcp:
+    driver: bridge
+
+volumes:
+  # Client OAuth Google, refresh token, clé Bing. Jamais dans git ni dans les images.
+  seo-data:
