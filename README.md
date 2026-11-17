@@ -18,8 +18,9 @@ Ask Claude about your organic search and analytics in plain language. For exampl
 - **Three data sources, one stack**: Google Search Console API, Bing Webmaster API and the GA4 Data and Admin APIs, all exposed as MCP tools.
 - **One Google consent**: a single OAuth sign-in grants `webmasters.readonly` and `analytics.readonly` to both MCP servers.
 - **No files to copy**: you sign in to Google in your browser on the published server. No credentials JSON is prepared on another machine.
-- **Minimal `.env`**: you only need `CLOUDFLARE_TUNNEL_TOKEN`. You enter the Google OAuth client and the Bing API key on a web `/setup` page, and they are stored in a persistent Docker volume.
+- **Minimal `.env`**: the tunnel token plus two non-secret Cloudflare Access identifiers (team domain and application AUD). You enter the Google OAuth client and the Bing API key on a web `/setup` page, and they are stored in a persistent Docker volume.
 - **Zero open ports**: traffic goes out through a Cloudflare Tunnel. Cloudflare Access (Managed OAuth and Dynamic Client Registration) lets in only your email address.
+- **Signed identity, not a header**: every request to `/setup` and to the MCP servers must carry a Cloudflare Access JWT whose RS256 signature, issuer, audience and expiry are verified. Even a route published without Access by mistake exposes nothing.
 - **Native arm64**: images are built natively on the Oracle server or on a GitHub ARM runner. No QEMU, no multi-arch.
 - **Read-only and hardened**: containers run as non-root, with a read-only filesystem and no Linux capabilities. MCP payloads are not logged.
 - **Updates itself**: versions are pinned. Renovate opens a pull request for every npm, PyPI, Docker and Actions update and merges it on its own once the full test suite passes on arm64. The `updater` service then deploys the new version on your server within minutes. No SSH, no manual `git pull`.
@@ -30,9 +31,11 @@ Ask Claude about your organic search and analytics in plain language. For exampl
 Claude ──HTTPS──▶ Cloudflare Access (Managed OAuth + DCR, policy = your email)
                       │
                       ▼  tunnel (outbound only)
-                 cloudflared ──┬──▶ setup:8080      /setup, /setup/callback
-                               ├──▶ gsc-bing:8000   /gsc-bing/mcp  (search-console-mcp 2.1.4 via supergateway 4.2.2)
-                               └──▶ ga4:8000        /ga4/mcp       (analytics-mcp 1.1.0 via supergateway 4.2.2)
+                 cloudflared ──┬──▶ setup:8080   /setup, /setup/callback        (verifies the Access JWT)
+                               └──▶ gate:8080    /gsc-bing/mcp, /ga4/mcp        (verifies the Access JWT)
+                                       │  internal "backend" network only
+                                       ├──▶ gsc-bing:8000  (search-console-mcp 2.1.4 via supergateway 4.2.2)
+                                       └──▶ ga4:8000       (analytics-mcp 1.1.0 via supergateway 4.2.2)
 
 volume seo-data (/data): setup.json (OAuth client, account), google/authorized_user.json (refresh token), bing_api_key
 ```
@@ -40,6 +43,7 @@ volume seo-data (/data): setup.json (OAuth client, account), google/authorized_u
 | Service | What it does |
 |---|---|
 | `setup` | Configuration page and web OAuth flow, with Google redirecting to `https://<domain>/setup/callback`. Writes credentials to the volume. Python, standard library only. |
+| `gate` | The only way to the MCP servers. Verifies the Cloudflare Access JWT on every request, enforces the Google account linked in `/setup`, then streams the request to `gsc-bing` or `ga4`. Python, standard library only. |
 | `gsc-bing` | The npm package [`search-console-mcp`](https://www.npmjs.com/package/search-console-mcp) (Google Search Console + Bing Webmaster Tools), exposed as Streamable HTTP by [`supergateway`](https://www.npmjs.com/package/supergateway). |
 | `ga4` | Google's official GA4 MCP server, the PyPI package [`analytics-mcp`](https://pypi.org/project/analytics-mcp/), exposed as Streamable HTTP by `supergateway`. |
 | `cloudflared` | Outbound Cloudflare Tunnel. Nothing listens on the host. |
@@ -74,8 +78,10 @@ In **Cloudflare One / Zero Trust → Networks → Tunnels**:
 | Hostname | Path | Service |
 |---|---|---|
 | `seo.example.com` | `^/setup` | `http://setup:8080` |
-| `seo.example.com` | `^/gsc-bing/` | `http://gsc-bing:8000` |
-| `seo.example.com` | `^/ga4/` | `http://ga4:8000` |
+| `seo.example.com` | `^/gsc-bing/` | `http://gate:8080` |
+| `seo.example.com` | `^/ga4/` | `http://gate:8080` |
+
+Optional, recommended: in each route's settings, under *Access*, enable **Protect with Access** (`originRequest.access.required`) with your team name and the application AUD. `cloudflared` then rejects requests without a valid Access token before they even reach the containers.
 
 ### 3. Cloudflare Access (Managed OAuth + DCR)
 
@@ -84,9 +90,12 @@ In **Cloudflare One / Zero Trust → Networks → Tunnels**:
    - **Domain**: `seo.example.com`, with no path, so one policy covers `/setup`, `/gsc-bing/mcp` and `/ga4/mcp`;
    - **Policy**: *Allow → Include → Emails →* `you@example.com`;
    - in the application settings, enable **Managed OAuth** (Access acts as the OAuth authorization server for MCP clients) and **Dynamic Client Registration**. If the UI asks for allowed redirect URIs, add Claude's: `https://claude.ai/api/mcp/auth_callback`.
-3. To check, open `https://seo.example.com/setup` in a private window. Cloudflare must ask you to log in first.
+3. Note two values for `.env` (they are identifiers, not secrets):
+   - `ACCESS_TEAM_DOMAIN`: your team domain, for example `my-team.cloudflareaccess.com` (*Settings → Custom pages*, or the team name chosen at sign-up);
+   - `ACCESS_AUD`: the **Application Audience (AUD) Tag**, on the application's *Overview* tab.
+4. To check, open `https://seo.example.com/setup` in a private window. Cloudflare must ask you to log in first.
 
-> Defense in depth: `setup` rejects any request that lacks the `Cf-Access-Authenticated-User-Email` header. It also requires the Google account you connect to be **the same** as the one Access authenticated. Otherwise it revokes the token immediately.
+> Defense in depth: `setup` and `gate` do not trust any plain header. They verify the `Cf-Access-Jwt-Assertion` JWT that Access adds to every request: RS256 signature against your team's public keys, issuer, audience (AUD) and expiry. Without `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`, they refuse everything. `setup` also requires the Google account you connect to be **the same** as the one Access authenticated, and revokes the token otherwise. Once that account is linked, `gate` refuses every other Access user.
 
 ### 4. Deploy on the arm64 server
 
@@ -98,7 +107,7 @@ git clone https://github.com/flocom/mcp-seo-geo-stack.git
 cd mcp-seo-geo-stack && cp .env.example .env && chmod 600 .env
 ```
 
-Paste the tunnel token into `.env` (`CLOUDFLARE_TUNNEL_TOKEN=…`), then:
+Fill in `.env`: the tunnel token (`CLOUDFLARE_TUNNEL_TOKEN=…`), `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD`. Then:
 
 ```bash
 docker compose up -d
@@ -167,9 +176,9 @@ Only read-only scopes are requested. Write and indexing tools return an authoriz
 
 ## Security model
 
-- **Network**: no published ports. Only `cloudflared` reaches the services, over the internal Docker network.
-- **Identity**: Cloudflare Access protects every path, with a single-email policy. `/setup` also checks the Access header and ties the Google account to that email.
-- **Secrets**: they live only in `.env` (tunnel token) and in the `mcp-seo-geo-stack_seo-data` volume, with files at mode `0600`. Secrets are excluded from git (`.gitignore`) and from the build context (`.dockerignore`), so they never end up in an image.
+- **Network**: no published ports. `cloudflared` only reaches `setup` and `gate`. The MCP servers sit on a separate internal network that only `gate` can reach.
+- **Identity**: Cloudflare Access protects every path, with a single-email policy. `setup` and `gate` independently verify the signed Access JWT (signature, issuer, AUD, expiry) on every request, so a forged header, a token from another team or application, or an expired token is refused, even if a route were published without Access. Once a Google account is linked, only that email gets through `gate`.
+- **Secrets**: they live only in `.env` (tunnel token; the Access team domain and AUD are not secret) and in the `mcp-seo-geo-stack_seo-data` volume, with files at mode `0600`. Secrets are excluded from git (`.gitignore`) and from the build context (`.dockerignore`), so they never end up in an image.
 - **Containers**: non-root (uid 10001), `read_only`, `cap_drop: ALL`, `no-new-privileges`. MCP services mount the volume read-only.
 - **Logs**: supergateway runs with `--logLevel none`, so MCP payloads (your SEO data) are not written to Docker logs.
 - **OAuth**: PKCE, a random `state`, a CSRF token on every form, and revocation from `/setup`.
@@ -210,7 +219,8 @@ git pull && docker compose up -d --build
 
 | Test | What it checks | Command |
 |---|---|---|
-| `tests/test_setup_flow.py` | The full `/setup` OAuth flow against a mock Google: Access guard, CSRF, PKCE, state, account matching, file permissions, revocation | `python3 tests/test_setup_flow.py` |
+| `tests/test_setup_flow.py` | The full `/setup` OAuth flow against a mock Google: Access JWT verification (forged header, foreign key, expired, wrong audience or issuer, `alg: none`, tampered payload), CSRF, PKCE, state, account matching, file permissions, revocation | `python3 tests/test_setup_flow.py` |
+| `tests/test_gate.py` | The gate against a fake MCP server: no request gets through without a valid JWT, JWT and cookies not forwarded, linked-account lock, SSE streaming | `python3 tests/test_gate.py` |
 | `tests/mcp-smoke.mjs` | MCP over Streamable HTTP: `initialize`, `tools/list`, and an optional `tools/call` | `node tests/mcp-smoke.mjs <url>` |
 | `tests/e2e.sh` | The full Docker stack on an arm64 runner: images, wait-for-config, credential reload, both MCP endpoints | `bash tests/e2e.sh` |
 | `tests/updater-e2e.sh` | Automatic updates against a local git origin: new commit deployed (updater included), data kept, broken commit harmless, no root-owned files | `bash tests/updater-e2e.sh` |
@@ -228,7 +238,9 @@ docker run --rm -v mcp-seo-geo-stack_seo-data:/data:ro -v "$PWD":/out alpine tar
 | Symptom | Fix |
 |---|---|
 | `502` on `/gsc-bing/mcp` or `/ga4/mcp` | The service is waiting for configuration. Complete `/setup`, then check `docker compose logs gsc-bing ga4`. |
-| `/setup` says "Accès refusé … en-tête absent" | The request bypassed Access. Make sure the Access application covers the hostname. |
+| `/setup` says "Accès refusé … jeton Cloudflare Access absent" | The request bypassed Access. Make sure the Access application covers the hostname. |
+| `/setup` says "Cloudflare Access n'est pas configuré" (503), MCP calls get `403` | Set `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` in `.env`, then `docker compose up -d`. |
+| `403` "jeton destiné à une autre application" | `ACCESS_AUD` does not match the AUD tag of the Access application that protects the hostname. |
 | `redirect_uri_mismatch` from Google | The URI in Google Cloud must exactly match the one shown in `/setup`. |
 | "No refresh token" | Remove the app at myaccount.google.com/permissions, then reconnect. |
 | `403 API has not been used` | Enable that API in the OAuth client's Google Cloud project. |
@@ -282,7 +294,9 @@ The `genai_query_insights` tool flags queries that look like AI-assisted or conv
 ├── tests/{test_setup_flow.py,mcp-smoke.mjs,e2e.sh,updater-e2e.sh}
 └── services/
     ├── common/entrypoint.sh      # wait for config + restart on change
+    ├── common/access_jwt.py      # Cloudflare Access JWT verification
     ├── setup/{Dockerfile,app.py}
+    ├── gate/{Dockerfile,gate.py} # auth gateway in front of the MCP servers
     ├── gsc-bing/{Dockerfile,package.json,package-lock.json}
     ├── ga4/{Dockerfile,requirements.txt,package.json,package-lock.json}
     └── updater/{Dockerfile,updater.sh}   # automatic updates
