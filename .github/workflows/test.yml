@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: shellcheck
-        run: shellcheck services/common/entrypoint.sh tests/e2e.sh
+        run: shellcheck services/common/entrypoint.sh services/updater/updater.sh tests/e2e.sh tests/updater-e2e.sh
       - name: hadolint
         run: |
           for f in services/*/Dockerfile; do
@@ -58,9 +58,13 @@ jobs:
           node-version: "24"
       - name: Full stack (Docker, arm64)
         run: bash tests/e2e.sh
+      - name: Automatic updates (updater service)
+        run: bash tests/updater-e2e.sh
       - name: Container logs
         if: failure()
         uses: actions/upload-artifact@v5
         with:
           name: e2e-logs
-          path: e2e-logs.txt
+          path: |
+            e2e-logs.txt
+            updater-e2e-logs.txt

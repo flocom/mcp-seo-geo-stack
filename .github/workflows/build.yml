@@ -1,4 +1,5 @@
-# Construit les images linux/arm64 nativement sur un runner GitHub ARM
+# Construit les images linux/arm64 (une par commit de main, tag sha-xxxxxxx,
+# utilisé par le service updater en mode GHCR) nativement sur un runner GitHub ARM
 # (pas d'émulation QEMU, pas de multi-arch) et les publie sur GHCR.
 # Les PR (dont celles de Renovate) sont construites sans être publiées.
 # Les tests (lint, flux OAuth, e2e Docker) sont dans test.yml.
@@ -25,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [setup, gsc-bing, ga4]
+        service: [setup, gsc-bing, ga4, updater]
     steps:
       - uses: actions/checkout@v5
 

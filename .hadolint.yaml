@@ -2,3 +2,5 @@ ignored:
   # Debian package versions are not pinned: only libstdc++6/ca-certificates,
   # refreshed with the base image (tracked by Renovate).
   - DL3008
+  # Same for the Alpine packages of the updater (git, su-exec).
+  - DL3018
