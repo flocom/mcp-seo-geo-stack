@@ -110,7 +110,7 @@ Remplissez `.env` : le jeton du tunnel (`CLOUDFLARE_TUNNEL_TOKEN=…`), `ACCESS_
 docker compose up -d
 ```
 
-Au premier lancement, les trois images arm64 sont construites nativement sur le serveur. Pour utiliser plutôt les images publiées sur GHCR par GitHub Actions, ajoutez `IMAGE_PREFIX=ghcr.io/flocom/mcp-seo-geo-stack` dans `.env` (et `docker login ghcr.io` si le dépôt est privé), puis :
+Au premier lancement, les images arm64 sont construites nativement sur le serveur. Pour utiliser plutôt les images publiées sur GHCR par GitHub Actions, ajoutez `IMAGE_PREFIX=ghcr.io/flocom/mcp-seo-geo-stack` dans `.env`, puis :
 
 ```bash
 docker compose pull && docker compose up -d
