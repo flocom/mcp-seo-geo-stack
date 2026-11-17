@@ -4,7 +4,7 @@
 #   updater watch            (par défaut) Toutes les UPDATE_INTERVAL secondes : git fetch de la
 #                            branche suivie, fast-forward, puis redéploiement si le commit a changé.
 #   updater deploy <commit>  Lancé par « watch » dans un conteneur à part, où le dépôt est monté à
-#                            son chemin réel sur l'hôte : pull (images d'un registre, ex. GHCR) ou
+#                            son chemin réel sur l'hôte (lecture seule) : pull (images d'un registre, ex. GHCR) ou
 #                            build local des images, puis « docker compose up -d ». Ce conteneur à
 #                            part est nécessaire car « up -d » peut recréer le conteneur updater
 #                            lui-même.
@@ -55,13 +55,15 @@ run_deploy() {
     docker wait "$helper" >/dev/null 2>&1 || true
     docker rm -f "$helper" >/dev/null 2>&1 || true
   fi
-  docker run -d --name "$helper" --network none \
+  # Réseau par défaut : compose (buildx/bake) résout lui-même les images de base auprès du registre.
+  docker run -d --name "$helper" \
     --security-opt no-new-privileges:true \
     -v "$socket:/var/run/docker.sock" \
     -v "$workdir:$workdir:ro" -w "$workdir" \
     -e COMPOSE_PROJECT_NAME="$project" \
     -e COMPOSE_FILE="$(printf %s "$files" | tr , :)" \
     -e DOCKER_CONFIG=/tmp/.docker \
+    -e BUILDX_GIT_INFO=false \
     --entrypoint /usr/local/bin/updater "$image" deploy "$1" >/dev/null
   code=$(docker wait "$helper")
   docker logs "$helper" 2>&1
