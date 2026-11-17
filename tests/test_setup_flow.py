@@ -2,7 +2,8 @@
 """End-to-end test of the /setup app against a mock Google + Bing.
 
 Runs services/setup/app.py as a subprocess (standard library only, Python >= 3.10),
-then drives the full flow: Cloudflare Access guard, CSRF, OAuth client storage,
+then drives the full flow: Cloudflare Access guard (signed JWT: forged, expired,
+wrong audience/issuer/key are refused), CSRF, OAuth client storage,
 Google login (state + PKCE S256 verified by the mock), callback, account lock,
 revocation, Bing key, restart signal (/data/.version) and file permissions.
 
@@ -30,6 +31,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, "services", "setup", "app.py")
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+from access_token import DEFAULT_AUD, Key, mint  # noqa: E402
+
+KEY = Key(tempfile.mkdtemp(prefix="access-key-"))
+FOREIGN_KEY = Key(tempfile.mkdtemp(prefix="access-foreign-"))  # same kid, not published
 OWNER = "owner@example.com"
 CLIENT_ID = "123-test.apps.googleusercontent.com"
 CLIENT_SECRET = "GOCSPX-test-secret"
@@ -94,6 +100,8 @@ class MockHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path == "/certs":
+            return self._json(200, KEY.jwks())
         if path == "/userinfo":
             if not self._bearer_ok():
                 return self._json(401, {"error": "unauthorized"})
@@ -125,7 +133,7 @@ class Client:
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         headers = {}
         if self.email:
-            headers["Cf-Access-Authenticated-User-Email"] = self.email
+            headers["Cf-Access-Jwt-Assertion"] = mint(KEY, self.email)
         if self.jar:
             headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in self.jar.items())
         body = None
@@ -193,7 +201,9 @@ def main() -> int:
     env = dict(os.environ, DATA_DIR=data, PORT=str(app_port),
                SETUP_GOOGLE_TOKEN_URL=f"{base}/token", SETUP_GOOGLE_REVOKE_URL=f"{base}/revoke",
                SETUP_GOOGLE_USERINFO_URL=f"{base}/userinfo", SETUP_GSC_SITES_URL=f"{base}/gsc",
-               SETUP_GA_SUMMARIES_URL=f"{base}/ga", SETUP_BING_SITES_URL=f"{base}/bing?apikey=")
+               SETUP_GA_SUMMARIES_URL=f"{base}/ga", SETUP_BING_SITES_URL=f"{base}/bing?apikey=",
+               ACCESS_TEAM_DOMAIN="e2e.cloudflareaccess.com", ACCESS_AUD=DEFAULT_AUD,
+               ACCESS_CERTS_URL=f"{base}/certs")
     env.pop("SETUP_REQUIRE_ACCESS", None)
     proc = subprocess.Popen([sys.executable, APP], env=env, stderr=subprocess.PIPE, text=True)
     try:
@@ -210,6 +220,51 @@ def main() -> int:
         # --- Access guard / basics
         st, _, _ = Client(app_port, email=None).req("GET", "/setup")
         check("refuse request without Cloudflare Access header", st == 403, st)
+
+        def status_with(headers):
+            conn = http.client.HTTPConnection("127.0.0.1", app_port, timeout=10)
+            conn.request("GET", "/setup", headers=headers)
+            return conn.getresponse().status
+
+        good = mint(KEY, OWNER)
+        h64, p64, s64 = good.split(".")
+        claims = json.loads(base64.urlsafe_b64decode(p64 + "=" * (-len(p64) % 4)))
+        claims["email"] = "attacker@example.com"
+        tampered = f"{h64}.{base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b'=').decode()}.{s64}"
+        jwt_cases = [
+            ("forged email header alone", {"Cf-Access-Authenticated-User-Email": OWNER}),
+            ("JWT signed by another key", {"Cf-Access-Jwt-Assertion": mint(FOREIGN_KEY, OWNER)}),
+            ("expired JWT", {"Cf-Access-Jwt-Assertion": mint(KEY, OWNER, exp=-120)}),
+            ("JWT for another application (aud)", {"Cf-Access-Jwt-Assertion": mint(KEY, OWNER, aud="other-app")}),
+            ("JWT from another team (iss)", {"Cf-Access-Jwt-Assertion": mint(KEY, OWNER, iss="https://evil.cloudflareaccess.com")}),
+            ("unsigned JWT (alg none)", {"Cf-Access-Jwt-Assertion": mint(KEY, OWNER, alg="none")}),
+            ("JWT with tampered payload", {"Cf-Access-Jwt-Assertion": tampered}),
+            ("JWT with unknown key id", {"Cf-Access-Jwt-Assertion": mint(KEY, OWNER, kid="unknown")}),
+            ("service token JWT (no email)", {"Cf-Access-Jwt-Assertion": mint(KEY, None)}),
+            ("garbage JWT", {"Cf-Access-Jwt-Assertion": "not.a.jwt"}),
+        ]
+        for name, headers in jwt_cases:
+            st = status_with(headers)
+            check(f"refuse {name}", st == 403, st)
+        check("accept valid Access JWT", status_with({"Cf-Access-Jwt-Assertion": good}) == 200)
+
+        # Access not configured: everything refused (fail closed)
+        bare_port = free_port()
+        bare_env = {k: v for k, v in env.items() if not k.startswith("ACCESS_")}
+        bare_env["PORT"] = str(bare_port)
+        bare = subprocess.Popen([sys.executable, APP], env=bare_env, stderr=subprocess.DEVNULL)
+        try:
+            for _ in range(50):
+                try:
+                    socket.create_connection(("127.0.0.1", bare_port), timeout=0.2).close()
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            conn = http.client.HTTPConnection("127.0.0.1", bare_port, timeout=10)
+            conn.request("GET", "/setup", headers={"Cf-Access-Jwt-Assertion": good})
+            check("without ACCESS_TEAM_DOMAIN/ACCESS_AUD everything is refused", conn.getresponse().status == 503)
+        finally:
+            bare.kill()
         st, _, body = Client(app_port, email=None).req("GET", "/setup/healthz")
         check("healthz open without Access (docker healthcheck)", st == 200 and body == "ok", st)
         st, h, body = c.req("GET", "/setup")
@@ -218,7 +273,7 @@ def main() -> int:
         check("security headers present", "frame-ancestors 'none'" in h.get("Content-Security-Policy", "") and h.get("X-Frame-Options") == "DENY")
         st, h, body = c.req("GET", "/setup", None)
         conn = http.client.HTTPConnection("127.0.0.1", app_port)
-        conn.request("GET", "/setup", headers={"Host": "evil.com/\"><script>", "Cf-Access-Authenticated-User-Email": OWNER})
+        conn.request("GET", "/setup", headers={"Host": "evil.com/\"><script>", "Cf-Access-Jwt-Assertion": mint(KEY, OWNER)})
         r = conn.getresponse()
         check("invalid Host header rejected", r.status == 400, r.status)
 

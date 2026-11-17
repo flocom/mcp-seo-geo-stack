@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [setup, gsc-bing, ga4, updater]
+        service: [setup, gate, gsc-bing, ga4, updater]
     steps:
       - uses: actions/checkout@v5
 

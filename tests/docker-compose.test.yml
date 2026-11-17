@@ -1,9 +1,25 @@
 # Override used by tests/e2e.sh only: exposes the services on localhost
 # so the test can reach them, and keeps cloudflared out (no real tunnel token).
 # The updater has its own test (tests/updater-e2e.sh).
+# A fake Cloudflare Access team: jwks serves the public key (tests/access_token.py init).
+x-access: &access
+  ACCESS_TEAM_DOMAIN: e2e.cloudflareaccess.com
+  ACCESS_AUD: e2e-aud
+  ACCESS_CERTS_URL: http://jwks:8000/certs
+
 services:
   setup:
     ports: ["127.0.0.1:18080:8080"]
+    environment: *access
+  gate:
+    ports: ["127.0.0.1:18003:8080"]
+    environment: *access
+  jwks:
+    image: python:3.13-slim-trixie
+    command: ["python", "-m", "http.server", "8000", "--directory", "/srv"]
+    volumes:
+      - ${JWKS_DIR:?}:/srv:ro
+    networks: [mcp]
   gsc-bing:
     ports: ["127.0.0.1:18001:8000"]
   ga4:

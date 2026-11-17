@@ -30,6 +30,10 @@ import urllib.request
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# access_jwt.py : copié à côté de app.py dans l'image, dans services/common/ dans le dépôt.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "common"))
+import access_jwt  # noqa: E402
+
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 SETUP_FILE = os.path.join(DATA_DIR, "setup.json")
 CRED_FILE = os.path.join(DATA_DIR, "google", "authorized_user.json")
@@ -37,8 +41,9 @@ BING_FILE = os.path.join(DATA_DIR, "bing_api_key")
 VERSION_FILE = os.path.join(DATA_DIR, ".version")
 
 PORT = int(os.environ.get("PORT", "8080"))
-# Refuse toute requête qui n'est pas passée par Cloudflare Access (en-tête
-# Cf-Access-Authenticated-User-Email). Mettre à 0 uniquement pour un test local.
+# Refuse toute requête sans jeton Cloudflare Access valide (Cf-Access-Jwt-Assertion,
+# signature vérifiée, voir services/common/access_jwt.py). Mettre à 0 uniquement pour un
+# test local : l'adresse est alors lue, sans vérification, dans Cf-Access-Authenticated-User-Email.
 REQUIRE_ACCESS = os.environ.get("SETUP_REQUIRE_ACCESS", "1") != "0"
 
 SCOPE_GSC = "https://www.googleapis.com/auth/webmasters.readonly"
@@ -217,7 +222,8 @@ class Handler(BaseHTTPRequestHandler):
         return f"{'http' if local else 'https'}://{host}"
 
     def _access_email(self) -> str:
-        return (self.headers.get("Cf-Access-Authenticated-User-Email") or "").strip()
+        """Adresse authentifiée par Cloudflare Access, établie par _guard()."""
+        return getattr(self, "access_email", "")
 
     def _cookies(self) -> cookies.SimpleCookie:
         jar = cookies.SimpleCookie()
@@ -269,11 +275,18 @@ class Handler(BaseHTTPRequestHandler):
     def _guard(self) -> bool:
         """Contrôle d'accès : la requête doit venir de Cloudflare Access."""
         if not REQUIRE_ACCESS:
+            self.access_email = (self.headers.get("Cf-Access-Authenticated-User-Email") or "").strip()
             return True
-        email = self._access_email()
-        if not email:
-            self._send(403, page("Accès refusé", "<h1>Accès refusé</h1><p class='sub'>Cette page doit être servie derrière Cloudflare Access (en-tête <code>Cf-Access-Authenticated-User-Email</code> absent). Vérifiez l'application Access du domaine.</p>"))
+        if not access_jwt.configured():
+            self._send(503, page("Configuration requise", "<h1>Cloudflare Access n'est pas configuré</h1><p class='sub'>Renseignez <code>ACCESS_TEAM_DOMAIN</code> (ex. <code>mon-equipe.cloudflareaccess.com</code>) et <code>ACCESS_AUD</code> (Application Audience Tag de l'application Access) dans <code>.env</code>, puis <code>docker compose up -d</code>. Tant que ce n'est pas fait, tout accès est refusé.</p>"))
             return False
+        try:
+            email = access_jwt.email_from((self.headers.get("Cf-Access-Jwt-Assertion") or "").strip())
+        except access_jwt.AccessError as exc:
+            sys.stderr.write(f"accès refusé : {exc}\n")
+            self._send(403, page("Accès refusé", f"<h1>Accès refusé</h1><p class='sub'>Cette page doit être servie derrière Cloudflare Access : {esc(exc)}. Vérifiez l'application Access du domaine.</p>"))
+            return False
+        self.access_email = email
         owner = load_setup().get("google_account", "")
         if owner and owner.lower() != email.lower():
             self._send(403, page("Accès refusé", f"<h1>Accès refusé</h1><p class='sub'>Cette instance appartient à un autre compte.</p>"))
@@ -532,7 +545,8 @@ def main() -> None:
     if not os.access(DATA_DIR, os.W_OK):
         sys.exit(f"{DATA_DIR} n'est pas accessible en écriture")
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"setup : écoute sur :{PORT} (Cloudflare Access {'requis' if REQUIRE_ACCESS else 'NON requis'})", file=sys.stderr)
+    state = "NON requis (test)" if not REQUIRE_ACCESS else (f"requis, équipe {access_jwt.TEAM_DOMAIN}" if access_jwt.configured() else "NON CONFIGURÉ : tout accès refusé")
+    print(f"setup : écoute sur :{PORT} (Cloudflare Access {state})", file=sys.stderr)
     server.serve_forever()
 
 

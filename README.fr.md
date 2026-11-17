@@ -4,7 +4,8 @@
 
 Connecteur Claude **privé** pour **Google Search Console**, **Bing Webmaster Tools** et **Google Analytics 4**. Il tourne entièrement dans Docker sur un serveur **Oracle ARM** (linux/arm64) et il est publié par un **tunnel Cloudflare**. Aucun port n'est ouvert sur le serveur. **Cloudflare Access** en protège l'accès, et seul votre compte Google passe.
 
-- `.env` minimal : `CLOUDFLARE_TUNNEL_TOKEN`, rien d'autre.
+- `.env` minimal : le jeton du tunnel et deux identifiants Cloudflare Access non secrets (domaine de l'équipe, AUD de l'application).
+- L'identité est **vérifiée par signature**, pas par un simple en-tête : chaque requête vers `/setup` et vers les serveurs MCP doit porter un jeton Cloudflare Access (JWT) dont la signature RS256, l'émetteur, l'audience et l'expiration sont contrôlés. Une route publiée par erreur sans Access n'expose rien.
 - Le client OAuth Google et la clé Bing se saisissent sur la page web `/setup`. Ils sont stockés dans un volume Docker persistant.
 - La connexion Google se fait dans le navigateur, sur le serveur publié. Il n'y a aucun fichier JSON d'identifiants à préparer ni à copier.
 - Mises à jour automatiques de bout en bout : Renovate fusionne seul ses PR quand tous les tests passent, et le service `updater` les applique sur le serveur en quelques minutes.
@@ -15,9 +16,11 @@ Connecteur Claude **privé** pour **Google Search Console**, **Bing Webmaster To
 Claude ──HTTPS──▶ Cloudflare Access (OAuth géré + DCR, politique = votre adresse)
                       │
                       ▼  tunnel (sortant uniquement)
-                 cloudflared ──┬──▶ setup:8080      /setup, /setup/callback
-                               ├──▶ gsc-bing:8000   /gsc-bing/mcp  (search-console-mcp 2.1.4 via supergateway 4.2.2)
-                               └──▶ ga4:8000        /ga4/mcp       (analytics-mcp 1.1.0 via supergateway 4.2.2)
+                 cloudflared ──┬──▶ setup:8080   /setup, /setup/callback        (vérifie le JWT Access)
+                               └──▶ gate:8080    /gsc-bing/mcp, /ga4/mcp        (vérifie le JWT Access)
+                                       │  réseau interne « backend » uniquement
+                                       ├──▶ gsc-bing:8000  (search-console-mcp 2.1.4 via supergateway 4.2.2)
+                                       └──▶ ga4:8000       (analytics-mcp 1.1.0 via supergateway 4.2.2)
 
 volume seo-data (/data) : setup.json (client OAuth, compte), google/authorized_user.json (refresh token), bing_api_key
 ```
@@ -25,6 +28,7 @@ volume seo-data (/data) : setup.json (client OAuth, compte), google/authorized_u
 | Service | Rôle |
 |---|---|
 | `setup` | Page de configuration et flux OAuth web (redirection vers `https://<domaine>/setup/callback`). Écrit dans le volume. Python, bibliothèque standard uniquement. |
+| `gate` | Seul accès aux serveurs MCP. Vérifie le JWT Cloudflare Access de chaque requête, impose le compte Google lié dans `/setup`, puis relaie la requête en continu vers `gsc-bing` ou `ga4`. Python, bibliothèque standard uniquement. |
 | `gsc-bing` | Paquet npm `search-console-mcp`, exposé en Streamable HTTP par `supergateway` (mode stateful). |
 | `ga4` | Serveur officiel de Google, paquet PyPI `analytics-mcp`, exposé en Streamable HTTP par `supergateway`. |
 | `cloudflared` | Tunnel sortant vers Cloudflare. |
@@ -39,7 +43,7 @@ volume seo-data (/data) : setup.json (client OAuth, compte), google/authorized_u
   
   Le service tourne donc en **stdio** avec `google.auth.default()`, qui lit le **même** fichier `authorized_user` que gsc-bing. Vous donnez **un seul consentement** Google pour les deux scopes `webmasters.readonly` et `analytics.readonly`.
 - **Redémarrage automatique** : après chaque modification sur `/setup`, l'app incrémente `/data/.version`. Le lanceur commun (`services/common/entrypoint.sh`) voit le changement, arrête le serveur MCP, et Docker relance le conteneur, qui relit les identifiants. Aucun accès au socket Docker n'est nécessaire pour cela.
-- Les conteneurs tournent en non-root (uid 10001), en lecture seule, sans capabilities. Les services MCP montent le volume en lecture seule.
+- Les conteneurs tournent en non-root (uid 10001), en lecture seule, sans capabilities. Les services MCP montent le volume en lecture seule, et ne sont joignables que par `gate`, sur un réseau Docker séparé.
 
 ---
 
@@ -68,10 +72,12 @@ Dans **Cloudflare One / Zero Trust → Networks → Tunnels** :
 | Hostname | Path | Service |
 |---|---|---|
 | `seo.example.com` | `^/setup` | `http://setup:8080` |
-| `seo.example.com` | `^/gsc-bing/` | `http://gsc-bing:8000` |
-| `seo.example.com` | `^/ga4/` | `http://ga4:8000` |
+| `seo.example.com` | `^/gsc-bing/` | `http://gate:8080` |
+| `seo.example.com` | `^/ga4/` | `http://gate:8080` |
 
-Les noms `setup`, `gsc-bing` et `ga4` sont résolus sur le réseau Docker interne de la stack. Laissez la catch-all par défaut (`http_status:404`).
+Les noms `setup` et `gate` sont résolus sur le réseau Docker interne de la stack. `gsc-bing` et `ga4` ne sont pas joignables par le tunnel : seul `gate` y accède.
+
+Facultatif mais recommandé : dans les réglages de chaque route, section *Access*, activez **Protect with Access** (`originRequest.access.required`) avec le nom de votre équipe et l'AUD de l'application. `cloudflared` rejette alors toute requête sans jeton Access valide avant même qu'elle n'atteigne les conteneurs. Laissez la catch-all par défaut (`http_status:404`).
 
 ## 3. Application Cloudflare Access
 
@@ -81,9 +87,12 @@ Les noms `setup`, `gsc-bing` et `ga4` sont résolus sur le réseau Docker intern
    - **Politique** : *Allow*, règle *Include → Emails →* `votre.adresse@gmail.com` ;
    - **Fournisseur d'identité** : Google ; activez *Instant Auth* s'il est le seul ;
    - dans les réglages de l'application, activez **Managed OAuth** (Access sert alors d'authorization server OAuth pour les clients MCP) et **Dynamic Client Registration**. Si l'interface demande une liste de redirections autorisées, ajoutez celle de Claude, `https://claude.ai/api/mcp/auth_callback`.
-3. Pour vérifier, ouvrez `https://seo.example.com/setup` en navigation privée : Cloudflare doit vous demander de vous connecter avant d'afficher la page.
+3. Notez deux valeurs pour `.env` (ce sont des identifiants, pas des secrets) :
+   - `ACCESS_TEAM_DOMAIN` : le domaine de votre équipe, par exemple `mon-equipe.cloudflareaccess.com` (*Settings → Custom pages*, ou le nom d'équipe choisi à l'inscription) ;
+   - `ACCESS_AUD` : l'**Application Audience (AUD) Tag**, dans l'onglet *Overview* de l'application.
+4. Pour vérifier, ouvrez `https://seo.example.com/setup` en navigation privée : Cloudflare doit vous demander de vous connecter avant d'afficher la page.
 
-> Défense en profondeur : l'app `setup` refuse toute requête sans l'en-tête `Cf-Access-Authenticated-User-Email` ajouté par Access. Elle exige aussi que le compte Google connecté soit **le même** que celui authentifié par Access. Sinon, le jeton est révoqué immédiatement.
+> Défense en profondeur : `setup` et `gate` ne font confiance à aucun simple en-tête. Ils vérifient le jeton `Cf-Access-Jwt-Assertion` qu'Access ajoute à chaque requête : signature RS256 avec les clés publiques de votre équipe, émetteur, audience (AUD) et expiration. Sans `ACCESS_TEAM_DOMAIN` ni `ACCESS_AUD`, ils refusent tout. `setup` exige aussi que le compte Google connecté soit **le même** que celui authentifié par Access, et révoque le jeton sinon. Une fois ce compte lié, `gate` refuse tout autre utilisateur Access.
 
 ## 4. Déploiement sur le serveur Oracle ARM
 
@@ -95,13 +104,13 @@ git clone https://github.com/flocom/mcp-seo-geo-stack.git
 cd mcp-seo-geo-stack && cp .env.example .env && chmod 600 .env
 ```
 
-Collez le jeton du tunnel dans `.env` (`CLOUDFLARE_TUNNEL_TOKEN=…`), puis :
+Remplissez `.env` : le jeton du tunnel (`CLOUDFLARE_TUNNEL_TOKEN=…`), `ACCESS_TEAM_DOMAIN` et `ACCESS_AUD`. Puis :
 
 ```bash
 docker compose up -d
 ```
 
-Au premier lancement, les trois images arm64 sont construites nativement sur le serveur. Pour utiliser plutôt les images publiées sur GHCR par GitHub Actions, ajoutez `IMAGE_PREFIX=ghcr.io/flocom/mcp-seo-geo-stack` dans `.env` (et `docker login ghcr.io` si le dépôt est privé), puis :
+Au premier lancement, les images arm64 sont construites nativement sur le serveur. Pour utiliser plutôt les images publiées sur GHCR par GitHub Actions, ajoutez `IMAGE_PREFIX=ghcr.io/flocom/mcp-seo-geo-stack` dans `.env`, puis :
 
 ```bash
 docker compose pull && docker compose up -d
@@ -182,7 +191,7 @@ git pull && docker compose up -d --build
 
 ## Secrets et sauvegarde
 
-- Les secrets se trouvent **uniquement** dans `.env` (le jeton du tunnel) et dans le volume `mcp-seo-geo-stack_seo-data`. Ces deux emplacements sont exclus de git (`.gitignore`) et du contexte de build (`.dockerignore`), donc jamais copiés dans les images.
+- Les secrets se trouvent **uniquement** dans `.env` (le jeton du tunnel ; le domaine d'équipe et l'AUD Access ne sont pas secrets) et dans le volume `mcp-seo-geo-stack_seo-data`. Ces deux emplacements sont exclus de git (`.gitignore`) et du contexte de build (`.dockerignore`), donc jamais copiés dans les images.
 - Sauvegarde du volume :
 
 ```bash
@@ -196,7 +205,9 @@ docker run --rm -v mcp-seo-geo-stack_seo-data:/data:ro -v "$PWD":/out alpine tar
 | Symptôme | Piste |
 |---|---|
 | `502` sur `/gsc-bing/mcp` ou `/ga4/mcp` | Le service attend la configuration : finissez `/setup`, puis consultez `docker compose logs gsc-bing ga4`. |
-| `/setup` répond « Accès refusé… en-tête absent » | La requête n'est pas passée par Access : vérifiez que l'application Access couvre bien le nom d'hôte. |
+| `/setup` répond « Accès refusé… jeton Cloudflare Access absent » | La requête n'est pas passée par Access : vérifiez que l'application Access couvre bien le nom d'hôte. |
+| `/setup` répond « Cloudflare Access n'est pas configuré » (503), les appels MCP reçoivent `403` | Renseignez `ACCESS_TEAM_DOMAIN` et `ACCESS_AUD` dans `.env`, puis `docker compose up -d`. |
+| `403` « jeton destiné à une autre application » | `ACCESS_AUD` ne correspond pas à l'AUD de l'application Access qui protège le nom d'hôte. |
 | `redirect_uri_mismatch` chez Google | L'URI déclaré dans Google Cloud doit être exactement celui affiché dans `/setup`. |
 | « pas de refresh token » | Retirez l'application sur myaccount.google.com/permissions, puis reconnectez-vous. |
 | Erreur 403 « API has not been used » | Activez l'API indiquée dans le projet Google Cloud du client OAuth. |
@@ -215,7 +226,9 @@ docker run --rm -v mcp-seo-geo-stack_seo-data:/data:ro -v "$PWD":/out alpine tar
 ├── tests/{test_setup_flow.py,mcp-smoke.mjs,e2e.sh,updater-e2e.sh}
 └── services/
     ├── common/entrypoint.sh      # attente de la config + redémarrage sur changement
+    ├── common/access_jwt.py      # vérification des JWT Cloudflare Access
     ├── setup/{Dockerfile,app.py}
+    ├── gate/{Dockerfile,gate.py} # passerelle d'authentification devant les serveurs MCP
     ├── gsc-bing/{Dockerfile,package.json,package-lock.json}
     ├── ga4/{Dockerfile,requirements.txt,package.json,package-lock.json}
     └── updater/{Dockerfile,updater.sh}   # mises à jour automatiques
