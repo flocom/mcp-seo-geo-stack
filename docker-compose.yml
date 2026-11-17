@@ -29,8 +29,26 @@ services:
       dockerfile: services/setup/Dockerfile
       platforms: [linux/arm64]
     image: ${IMAGE_PREFIX:-mcp-seo-geo-stack}/setup:${IMAGE_TAG:-latest}
+    environment: &access
+      # Vérification des jetons Cloudflare Access (voir .env.example). Sans ces deux
+      # valeurs, setup et gate refusent tout.
+      ACCESS_TEAM_DOMAIN: ${ACCESS_TEAM_DOMAIN:-}
+      ACCESS_AUD: ${ACCESS_AUD:-}
     volumes:
       - seo-data:/data
+
+  # Seule porte d'entrée vers les serveurs MCP : le tunnel envoie /gsc-bing/ et /ga4/ ici.
+  gate:
+    <<: *service
+    build:
+      context: .
+      dockerfile: services/gate/Dockerfile
+      platforms: [linux/arm64]
+    image: ${IMAGE_PREFIX:-mcp-seo-geo-stack}/gate:${IMAGE_TAG:-latest}
+    environment: *access
+    volumes:
+      - seo-data:/data:ro
+    networks: [mcp, backend]
 
   gsc-bing:
     <<: *service
@@ -42,6 +60,8 @@ services:
     volumes:
       - seo-data:/data:ro
     depends_on: [setup]
+    # Pas sur le réseau du tunnel : joignable uniquement par gate.
+    networks: [backend]
 
   ga4:
     <<: *service
@@ -53,6 +73,8 @@ services:
     volumes:
       - seo-data:/data:ro
     depends_on: [setup]
+    # Pas sur le réseau du tunnel : joignable uniquement par gate.
+    networks: [backend]
 
   cloudflared:
     <<: *service
@@ -85,7 +107,11 @@ services:
     networks: [updater]
 
 networks:
+  # cloudflared, setup, gate.
   mcp:
+    driver: bridge
+  # gate et serveurs MCP (accès sortant vers les API Google et Bing).
+  backend:
     driver: bridge
   updater:
     driver: bridge

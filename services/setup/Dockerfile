@@ -9,6 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PORT=8080
 
 WORKDIR /app
+COPY services/common/access_jwt.py /app/access_jwt.py
 COPY services/setup/app.py /app/app.py
 
 RUN mkdir -p /data && chown 10001:10001 /data

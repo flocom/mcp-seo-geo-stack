@@ -15,6 +15,8 @@ async function rpc(body, { notify = false } = {}) {
     "content-type": "application/json",
     accept: "application/json, text/event-stream",
     "mcp-protocol-version": "2025-06-18",
+    // Extra headers, e.g. the Cloudflare Access JWT when going through the gate.
+    ...(process.env.MCP_HEADERS ? JSON.parse(process.env.MCP_HEADERS) : {}),
   };
   if (sessionId) headers["mcp-session-id"] = sessionId;
   const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
