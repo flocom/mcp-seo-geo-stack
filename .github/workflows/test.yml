@@ -1,0 +1,66 @@
+# Lint, unit tests (OAuth flow against a mock Google) and full Docker
+# end-to-end test on a native arm64 runner.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck
+        run: shellcheck services/common/entrypoint.sh tests/e2e.sh
+      - name: hadolint
+        run: |
+          for f in services/*/Dockerfile; do
+            echo "::group::$f"
+            docker run --rm -i -v "$PWD/.hadolint.yaml:/.config/hadolint.yaml:ro" hadolint/hadolint:v2.12.0 < "$f"
+            echo "::endgroup::"
+          done
+      - name: Python syntax
+        run: python3 -m py_compile services/setup/app.py tests/test_setup_flow.py
+      - name: Node syntax
+        run: node --check tests/mcp-smoke.mjs
+      - name: Renovate config
+        run: npx --yes --package renovate -- renovate-config-validator --strict renovate.json
+
+  setup-flow:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: google-auth (to check the generated credentials file)
+        run: pip install "google-auth~=2.62"
+      - name: OAuth flow against a mock Google
+        run: python tests/test_setup_flow.py
+
+  e2e:
+    runs-on: ubuntu-24.04-arm
+    needs: [lint, setup-flow]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: Full stack (Docker, arm64)
+        run: bash tests/e2e.sh
+      - name: Container logs
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: e2e-logs
+          path: e2e-logs.txt

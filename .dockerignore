@@ -1,0 +1,15 @@
+# Rien de secret ni d'inutile dans le contexte de build
+.env
+*.env
+.git
+.github
+data
+backup-*.tar.gz
+**/node_modules
+**/__pycache__
+README.md
+renovate.json
+docker-compose*.yml
+tests
+LICENSE
+.hadolint.yaml

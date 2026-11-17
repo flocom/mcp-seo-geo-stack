@@ -1,0 +1,2 @@
+# Serveur MCP officiel Google Analytics (mis à jour par Renovate, manager pip_requirements)
+analytics-mcp==1.1.0

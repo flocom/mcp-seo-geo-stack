@@ -1,0 +1,11 @@
+# Secrets : uniquement dans .env et dans le volume Docker
+.env
+*.env
+!.env.example
+data/
+*.json.tmp-*
+backup-*.tar.gz
+
+node_modules/
+__pycache__/
+.DS_Store

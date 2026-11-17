@@ -1,0 +1,9 @@
+{
+  "name": "mcp-seo-geo-stack-ga4-gateway",
+  "private": true,
+  "description": "supergateway pour exposer analytics-mcp (stdio) en Streamable HTTP",
+  "license": "MIT",
+  "dependencies": {
+    "supergateway": "4.2.2"
+  }
+}
