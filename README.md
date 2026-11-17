@@ -22,7 +22,7 @@ Ask Claude about your organic search and analytics in plain language. For exampl
 - **Zero open ports**: traffic goes out through a Cloudflare Tunnel. Cloudflare Access (Managed OAuth and Dynamic Client Registration) lets in only your email address.
 - **Native arm64**: images are built natively on the Oracle server or on a GitHub ARM runner. No QEMU, no multi-arch.
 - **Read-only and hardened**: containers run as non-root, with a read-only filesystem and no Linux capabilities. MCP payloads are not logged.
-- **Kept up to date**: versions are pinned, Renovate opens pull requests for npm, PyPI, Docker and Actions updates, and GitHub Actions publishes images to GHCR.
+- **Updates itself**: versions are pinned. Renovate opens a pull request for every npm, PyPI, Docker and Actions update and merges it on its own once the full test suite passes on arm64. The `updater` service then deploys the new version on your server within minutes. No SSH, no manual `git pull`.
 
 ## Architecture
 
@@ -43,6 +43,7 @@ volume seo-data (/data): setup.json (OAuth client, account), google/authorized_u
 | `gsc-bing` | The npm package [`search-console-mcp`](https://www.npmjs.com/package/search-console-mcp) (Google Search Console + Bing Webmaster Tools), exposed as Streamable HTTP by [`supergateway`](https://www.npmjs.com/package/supergateway). |
 | `ga4` | Google's official GA4 MCP server, the PyPI package [`analytics-mcp`](https://pypi.org/project/analytics-mcp/), exposed as Streamable HTTP by `supergateway`. |
 | `cloudflared` | Outbound Cloudflare Tunnel. Nothing listens on the host. |
+| `updater` | Automatic updates: checks the GitHub repository every 5 minutes, fast-forwards the server checkout, rebuilds or pulls the images and restarts only what changed. |
 
 ---
 
@@ -111,6 +112,8 @@ docker compose pull && docker compose up -d
 
 Until `/setup` is completed, `gsc-bing` and `ga4` wait for configuration. This is expected.
 
+From now on, the server keeps itself up to date: see [Automatic updates](#automatic-updates). Keep the clone on the `main` branch and do not edit tracked files on the server (settings go in `.env`, which git ignores).
+
 ### 5. Configure on the `/setup` page
 
 Open `https://seo.example.com/setup`:
@@ -170,16 +173,37 @@ Only read-only scopes are requested. Write and indexing tools return an authoriz
 - **Containers**: non-root (uid 10001), `read_only`, `cap_drop: ALL`, `no-new-privileges`. MCP services mount the volume read-only.
 - **Logs**: supergateway runs with `--logLevel none`, so MCP payloads (your SEO data) are not written to Docker logs.
 - **OAuth**: PKCE, a random `state`, a CSRF token on every form, and revocation from `/setup`.
+- **Updater**: it mounts the Docker socket, which is equivalent to root on the host, so that it can redeploy the stack. It runs on its own network with no access to the MCP services, without capabilities other than `SETUID`/`SETGID` (to run git as the owner of the checkout), and it only deploys what is merged into the repository's `main` branch. Anyone who can push to that branch can change what runs on your server: protect it accordingly, or set `UPDATE_INTERVAL=0` to turn automatic updates off.
 
-## Updates
+## Automatic updates
 
-- **Pinned versions** live in `services/gsc-bing/package.json` and `package-lock.json`, `services/ga4/requirements.txt`, the Dockerfiles, and the `cloudflared` image tag.
-- **Renovate** (`renovate.json`) opens PRs for npm, PyPI, Docker and GitHub Actions, with a dedicated PR for each MCP server.
-- **GitHub Actions** (`build.yml`) builds the three images **natively on `ubuntu-24.04-arm`** and pushes them to `ghcr.io/flocom/mcp-seo-geo-stack/<service>` (`latest` and `sha-…`). Pull requests are built but not published.
-- On the server:
+Every update follows the same path, with no manual step:
+
+```
+Renovate PR ──▶ CI on arm64 (lint, OAuth flow, Docker e2e, image builds) ──▶ auto-merge into main
+                                                                                 │
+                         server: updater ──▶ git fetch + fast-forward ◀──────────┘ (every 5 minutes)
+                                          ──▶ build (or pull from GHCR) ──▶ docker compose up -d
+```
+
+- **Pinned versions** live in `services/gsc-bing/package.json` and `package-lock.json`, `services/ga4/requirements.txt`, the Dockerfiles, and the `cloudflared` image tag. Base images are also pinned by digest, so even an upstream security rebuild arrives as a tested pull request.
+- **Renovate** (`renovate.json`) opens pull requests for npm, PyPI, Docker and GitHub Actions, with a dedicated PR for each MCP server, and **merges them automatically once every check is green**. A red check blocks the merge, and the PR waits for you. New npm and PyPI releases must be 3 days old before they are proposed, a common guard against compromised packages. Install the [Renovate GitHub app](https://github.com/apps/renovate) on your repository (or fork) to turn this on.
+- **GitHub Actions** (`build.yml`) builds the four images **natively on `ubuntu-24.04-arm`** and pushes them to `ghcr.io/flocom/mcp-seo-geo-stack/<service>` with the tags `latest` and `sha-<commit>`. Pull requests are built but not published.
+- **The `updater` service** on the server checks the repository every 5 minutes (`UPDATE_INTERVAL` in `.env`, in seconds). When `main` has moved, it fast-forwards the checkout, then:
+  - by default, rebuilds the images natively on the server;
+  - with `IMAGE_PREFIX=ghcr.io/flocom/mcp-seo-geo-stack` in `.env`, pulls the images built by GitHub Actions for that exact commit (`sha-<commit>`), and waits until they are published;
+  - runs `docker compose up -d`, which restarts only the services that changed, including the updater itself, and removes unused images.
+
+  The data volume is kept. A commit that fails to deploy leaves the running stack untouched and is retried at the next check. Follow it with:
 
 ```bash
-git pull && docker compose pull && docker compose up -d
+docker compose logs -f updater
+```
+
+To turn automatic updates off, set `UPDATE_INTERVAL=0` in `.env`, then run `docker compose up -d`. To update by hand instead:
+
+```bash
+git pull && docker compose up -d --build
 ```
 
 ## Testing
@@ -189,8 +213,9 @@ git pull && docker compose pull && docker compose up -d
 | `tests/test_setup_flow.py` | The full `/setup` OAuth flow against a mock Google: Access guard, CSRF, PKCE, state, account matching, file permissions, revocation | `python3 tests/test_setup_flow.py` |
 | `tests/mcp-smoke.mjs` | MCP over Streamable HTTP: `initialize`, `tools/list`, and an optional `tools/call` | `node tests/mcp-smoke.mjs <url>` |
 | `tests/e2e.sh` | The full Docker stack on an arm64 runner: images, wait-for-config, credential reload, both MCP endpoints | `bash tests/e2e.sh` |
+| `tests/updater-e2e.sh` | Automatic updates against a local git origin: new commit deployed (updater included), data kept, broken commit harmless, no root-owned files | `bash tests/updater-e2e.sh` |
 
-The `test.yml` workflow runs all three on every push and pull request.
+The `test.yml` workflow runs all of them on every push and pull request.
 
 ## Backup
 
@@ -208,6 +233,7 @@ docker run --rm -v mcp-seo-geo-stack_seo-data:/data:ro -v "$PWD":/out alpine tar
 | "No refresh token" | Remove the app at myaccount.google.com/permissions, then reconnect. |
 | `403 API has not been used` | Enable that API in the OAuth client's Google Cloud project. |
 | Token expires after 7 days | The consent screen is still in "Testing". Publish it to production and reconnect. |
+| Updates are no longer applied | Check `docker compose logs updater`. "fast-forward impossible" means tracked files were edited on the server or the branch diverged: run `git status`, then `git stash` or `git reset --hard origin/main`. |
 
 ## FAQ
 
@@ -232,6 +258,9 @@ Your data flows directly between your server and the Google and Bing APIs, and b
 ### Will the Google refresh token expire?
 Not if the OAuth consent screen is **In production**. It stays valid until you revoke it or leave it unused for 6 months. In "Testing" mode it expires after 7 days.
 
+### How does the server stay up to date?
+Renovate opens a pull request for each new version of the MCP servers, the base images, `cloudflared` and the GitHub Actions. It merges the pull request automatically once the tests pass on arm64. The `updater` service on your server notices the new commit within 5 minutes and redeploys only what changed. You do nothing.
+
 ### Does it help with GEO (Generative Engine Optimization)?
 The `genai_query_insights` tool flags queries that look like AI-assisted or conversational searches in Google and Bing data. Combined with GA4 reports, it helps you track how your site performs in AI-driven search.
 
@@ -239,7 +268,7 @@ The `genai_query_insights` tool flags queries that look like AI-assisted or conv
 
 - **search-console-mcp 2.1.4**: its built-in `setup` starts a server on `127.0.0.1`, which is unusable on a headless server. It does read `GOOGLE_APPLICATION_CREDENTIALS` and passes it to `google.auth.GoogleAuth({ keyFilename })`, and google-auth-library accepts an **`authorized_user`** file (client_id, client_secret, refresh_token). It reads `BING_API_KEY` for Bing. Calls to `@napi-rs/keyring` sit inside `try/catch`, so there is **no hard dependency on an OS keychain**. Its encrypted config file (`~/.search-console-mcp-config.enc`) is not used here.
 - **analytics-mcp 1.1.0**: in stdio mode it uses `google.auth.default()`, which loads the **same** `authorized_user` file.
-- **Automatic reload**: after each change, `/setup` bumps `/data/.version`. The shared launcher (`services/common/entrypoint.sh`) sees it, stops the MCP server, and Docker restarts the container (`restart: unless-stopped`). No Docker socket is needed.
+- **Automatic reload**: after each change, `/setup` bumps `/data/.version`. The shared launcher (`services/common/entrypoint.sh`) sees it, stops the MCP server, and Docker restarts the container (`restart: unless-stopped`). No Docker socket is needed for this.
 - **supergateway 4.2.2** runs in stateful Streamable HTTP mode, with one MCP child process per session and a 30-minute session timeout.
 
 ## Project layout
@@ -250,12 +279,13 @@ The `genai_query_insights` tool flags queries that look like AI-assisted or conv
 ├── .env.example
 ├── renovate.json
 ├── .github/workflows/{build.yml,test.yml}
-├── tests/{test_setup_flow.py,mcp-smoke.mjs,e2e.sh}
+├── tests/{test_setup_flow.py,mcp-smoke.mjs,e2e.sh,updater-e2e.sh}
 └── services/
     ├── common/entrypoint.sh      # wait for config + restart on change
     ├── setup/{Dockerfile,app.py}
     ├── gsc-bing/{Dockerfile,package.json,package-lock.json}
-    └── ga4/{Dockerfile,requirements.txt,package.json,package-lock.json}
+    ├── ga4/{Dockerfile,requirements.txt,package.json,package-lock.json}
+    └── updater/{Dockerfile,updater.sh}   # automatic updates
 ```
 
 ## License

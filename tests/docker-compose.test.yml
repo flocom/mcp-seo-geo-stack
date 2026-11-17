@@ -1,5 +1,6 @@
 # Override used by tests/e2e.sh only: exposes the services on localhost
 # so the test can reach them, and keeps cloudflared out (no real tunnel token).
+# The updater has its own test (tests/updater-e2e.sh).
 services:
   setup:
     ports: ["127.0.0.1:18080:8080"]
@@ -9,3 +10,5 @@ services:
     ports: ["127.0.0.1:18002:8000"]
   cloudflared:
     profiles: ["tunnel"]
+  updater:
+    profiles: ["updater"]

@@ -3,6 +3,9 @@
 #
 #   docker compose up -d            # construit les images arm64 localement si besoin
 #   docker compose pull && docker compose up -d   # avec IMAGE_PREFIX=ghcr.io/flocom/mcp-seo-geo-stack
+#
+# Ensuite, le service « updater » applique seul chaque nouvelle version de la branche suivie
+# (git pull, build ou pull des images, docker compose up -d). Voir README, « Automatic updates ».
 name: mcp-seo-geo-stack
 
 x-service: &service
@@ -61,8 +64,30 @@ services:
       setup:
         condition: service_healthy
 
+  updater:
+    <<: *service
+    build:
+      context: .
+      dockerfile: services/updater/Dockerfile
+      platforms: [linux/arm64]
+    image: ${IMAGE_PREFIX:-mcp-seo-geo-stack}/updater:${IMAGE_TAG:-latest}
+    # su-exec : git tourne avec l'uid du propriétaire du dépôt.
+    cap_add: [SETUID, SETGID]
+    environment:
+      UPDATE_INTERVAL: ${UPDATE_INTERVAL:-300}
+      DOCKER_CONFIG: /tmp/.docker
+    volumes:
+      # Accès au démon Docker : nécessaire pour redéployer la stack (équivalent root sur l'hôte).
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Le dépôt cloné sur le serveur (git fetch + fast-forward).
+      - .:/repo
+    # Réseau à part : accès sortant pour git, aucun accès aux services MCP.
+    networks: [updater]
+
 networks:
   mcp:
+    driver: bridge
+  updater:
     driver: bridge
 
 volumes:

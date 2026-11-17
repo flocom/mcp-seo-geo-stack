@@ -7,6 +7,7 @@ Connecteur Claude **privé** pour **Google Search Console**, **Bing Webmaster To
 - `.env` minimal : `CLOUDFLARE_TUNNEL_TOKEN`, rien d'autre.
 - Le client OAuth Google et la clé Bing se saisissent sur la page web `/setup`. Ils sont stockés dans un volume Docker persistant.
 - La connexion Google se fait dans le navigateur, sur le serveur publié. Il n'y a aucun fichier JSON d'identifiants à préparer ni à copier.
+- Mises à jour automatiques de bout en bout : Renovate fusionne seul ses PR quand tous les tests passent, et le service `updater` les applique sur le serveur en quelques minutes.
 
 ## Architecture
 
@@ -27,6 +28,7 @@ volume seo-data (/data) : setup.json (client OAuth, compte), google/authorized_u
 | `gsc-bing` | Paquet npm `search-console-mcp`, exposé en Streamable HTTP par `supergateway` (mode stateful). |
 | `ga4` | Serveur officiel de Google, paquet PyPI `analytics-mcp`, exposé en Streamable HTTP par `supergateway`. |
 | `cloudflared` | Tunnel sortant vers Cloudflare. |
+| `updater` | Mises à jour automatiques : interroge le dépôt GitHub toutes les 5 minutes, avance le clone du serveur, reconstruit ou télécharge les images et ne redémarre que ce qui a changé. |
 
 ### Choix techniques vérifiés dans le code des paquets
 
@@ -36,7 +38,7 @@ volume seo-data (/data) : setup.json (client OAuth, compte), google/authorized_u
   2. ses clients DCR, ses codes et ses jetons sont gardés **en mémoire** : chaque redémarrage forcerait une nouvelle autorisation, et il faudrait un second consentement Google.
   
   Le service tourne donc en **stdio** avec `google.auth.default()`, qui lit le **même** fichier `authorized_user` que gsc-bing. Vous donnez **un seul consentement** Google pour les deux scopes `webmasters.readonly` et `analytics.readonly`.
-- **Redémarrage automatique** : après chaque modification sur `/setup`, l'app incrémente `/data/.version`. Le lanceur commun (`services/common/entrypoint.sh`) voit le changement, arrête le serveur MCP, et Docker relance le conteneur, qui relit les identifiants. Aucun accès au socket Docker n'est nécessaire.
+- **Redémarrage automatique** : après chaque modification sur `/setup`, l'app incrémente `/data/.version`. Le lanceur commun (`services/common/entrypoint.sh`) voit le changement, arrête le serveur MCP, et Docker relance le conteneur, qui relit les identifiants. Aucun accès au socket Docker n'est nécessaire pour cela.
 - Les conteneurs tournent en non-root (uid 10001), en lecture seule, sans capabilities. Les services MCP montent le volume en lecture seule.
 
 ---
@@ -111,6 +113,8 @@ Tant que `/setup` n'a pas été rempli, `gsc-bing` et `ga4` attendent la configu
 docker compose logs -f gsc-bing ga4
 ```
 
+Ensuite, le serveur se tient à jour seul (voir [Mises à jour](#mises-à-jour)). Laissez le clone sur la branche `main` et ne modifiez pas les fichiers suivis par git sur le serveur : les réglages vont dans `.env`, que git ignore.
+
 ## 5. Configuration dans `/setup`
 
 Ouvrez `https://seo.example.com/setup` et authentifiez-vous via Cloudflare Access, puis :
@@ -146,16 +150,31 @@ Le nom exact des menus et la façon dont le portail s'authentifie auprès de ser
 
 ## Mises à jour
 
-- **Versions fixées** : `services/gsc-bing/package.json` et `package-lock.json` (search-console-mcp, supergateway), `services/ga4/requirements.txt` (analytics-mcp), images de base dans les Dockerfile, `cloudflared` dans `docker-compose.yml`.
-- **Renovate** (`renovate.json`) ouvre des PR pour npm, PyPI, les images Docker et les actions GitHub, avec une PR dédiée pour chaque serveur MCP. Activez l'app [Renovate](https://github.com/apps/renovate) sur le dépôt.
-- **GitHub Actions** (`.github/workflows/build.yml`) construit les trois images **linux/arm64 nativement** sur un runner `ubuntu-24.04-arm`, sans QEMU ni multi-arch. Les PR (y compris celles de Renovate) sont construites sans être publiées. Sur `main`, les images sont poussées vers `ghcr.io/flocom/mcp-seo-geo-stack/<service>:latest` et `:sha-xxxxxxx`.
-- Après fusion d'une PR, sur le serveur :
+Toutes les mises à jour suivent le même chemin, sans aucune étape manuelle :
 
-```bash
-git pull && docker compose pull && docker compose up -d
+```
+PR Renovate ──▶ CI arm64 (lint, flux OAuth, e2e Docker, builds) ──▶ fusion automatique dans main
+                                                                         │
+              serveur : updater ──▶ git fetch + fast-forward ◀───────────┘ (toutes les 5 minutes)
+                                 ──▶ build (ou pull depuis GHCR) ──▶ docker compose up -d
 ```
 
-  Ou, sans GHCR :
+- **Versions fixées** : `services/gsc-bing/package.json` et `package-lock.json` (search-console-mcp, supergateway), `services/ga4/requirements.txt` (analytics-mcp), images de base dans les Dockerfile, `cloudflared` dans `docker-compose.yml`. Les images de base sont aussi fixées par digest : même une reconstruction de sécurité en amont arrive sous forme de PR testée.
+- **Renovate** (`renovate.json`) ouvre des PR pour npm, PyPI, les images Docker et les actions GitHub, avec une PR dédiée pour chaque serveur MCP, et **les fusionne automatiquement quand tous les tests sont verts**. Un test rouge bloque la fusion : la PR vous attend. Une nouvelle version npm ou PyPI n'est proposée qu'après 3 jours, une protection classique contre les paquets compromis. Activez l'app [Renovate](https://github.com/apps/renovate) sur le dépôt.
+- **GitHub Actions** (`.github/workflows/build.yml`) construit les quatre images **linux/arm64 nativement** sur un runner `ubuntu-24.04-arm`, sans QEMU ni multi-arch. Les PR (y compris celles de Renovate) sont construites sans être publiées. Sur `main`, les images sont poussées vers `ghcr.io/flocom/mcp-seo-geo-stack/<service>:latest` et `:sha-xxxxxxx`.
+- **Le service `updater`** interroge le dépôt toutes les 5 minutes (`UPDATE_INTERVAL` dans `.env`, en secondes). Quand `main` a avancé, il avance le clone en fast-forward, puis :
+  - par défaut, reconstruit les images nativement sur le serveur ;
+  - avec `IMAGE_PREFIX=ghcr.io/flocom/mcp-seo-geo-stack` dans `.env`, télécharge les images construites par GitHub Actions pour ce commit précis (`sha-xxxxxxx`), en attendant qu'elles soient publiées ;
+  - lance `docker compose up -d`, qui ne redémarre que les services modifiés (updater compris), puis supprime les images inutilisées.
+
+  Le volume de données est conservé. Un commit qui échoue au déploiement laisse la stack en place et il est retenté à la vérification suivante. Pour suivre son activité :
+
+```bash
+docker compose logs -f updater
+```
+
+- **Sécurité** : l'updater monte le socket Docker, ce qui équivaut à un accès root sur l'hôte : c'est indispensable pour redéployer. Il tourne sur un réseau à part, sans accès aux services MCP, sans autre capability que `SETUID`/`SETGID` (git tourne avec l'uid du propriétaire du clone), et ne déploie que ce qui est fusionné dans `main`. Quiconque peut pousser sur cette branche peut changer ce qui tourne sur votre serveur : protégez-la en conséquence.
+- Pour désactiver les mises à jour automatiques : `UPDATE_INTERVAL=0` dans `.env`, puis `docker compose up -d`. Mise à jour manuelle :
 
 ```bash
 git pull && docker compose up -d --build
@@ -183,6 +202,7 @@ docker run --rm -v mcp-seo-geo-stack_seo-data:/data:ro -v "$PWD":/out alpine tar
 | Erreur 403 « API has not been used » | Activez l'API indiquée dans le projet Google Cloud du client OAuth. |
 | Le jeton expire au bout de 7 jours | L'écran de consentement est resté en mode « Test » : publiez-le en production, puis reconnectez-vous. |
 | Outils d'écriture ou d'indexation de search-console-mcp en erreur | Normal : seuls les scopes en lecture seule sont demandés. |
+| Les mises à jour ne s'appliquent plus | Consultez `docker compose logs updater`. « fast-forward impossible » signifie que des fichiers suivis ont été modifiés sur le serveur ou que la branche a divergé : `git status`, puis `git stash` ou `git reset --hard origin/main`. |
 
 ## Arborescence
 
@@ -191,10 +211,12 @@ docker run --rm -v mcp-seo-geo-stack_seo-data:/data:ro -v "$PWD":/out alpine tar
 ├── docker-compose.yml
 ├── .env.example
 ├── renovate.json
-├── .github/workflows/build.yml
+├── .github/workflows/{build.yml,test.yml}
+├── tests/{test_setup_flow.py,mcp-smoke.mjs,e2e.sh,updater-e2e.sh}
 └── services/
     ├── common/entrypoint.sh      # attente de la config + redémarrage sur changement
     ├── setup/{Dockerfile,app.py}
     ├── gsc-bing/{Dockerfile,package.json,package-lock.json}
-    └── ga4/{Dockerfile,requirements.txt,package.json,package-lock.json}
+    ├── ga4/{Dockerfile,requirements.txt,package.json,package-lock.json}
+    └── updater/{Dockerfile,updater.sh}   # mises à jour automatiques
 ```

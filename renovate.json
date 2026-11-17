@@ -17,13 +17,30 @@
     "github-actions"
   ],
   "rangeStrategy": "pin",
+  "pinDigests": true,
+  "automerge": true,
+  "automergeType": "pr",
+  "platformAutomerge": false,
+  "automergeSchedule": [
+    "at any time"
+  ],
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": [
       "before 6am on monday"
-    ]
+    ],
+    "automerge": true
   },
   "packageRules": [
+    {
+      "description": "Protection de la chaîne d'approvisionnement : une version npm ou PyPI doit avoir 3 jours avant d'être proposée (une version malveillante est généralement retirée avant).",
+      "matchDatasources": [
+        "npm",
+        "pypi"
+      ],
+      "minimumReleaseAge": "3 days",
+      "internalChecksFilter": "strict"
+    },
     {
       "description": "Serveurs MCP : une PR dédiée par paquet, jamais groupée",
       "matchPackageNames": [
@@ -56,24 +73,13 @@
       "groupName": "images de base"
     },
     {
-      "description": "Pas de saut de version majeure de Node ou Python sans intervention manuelle",
-      "matchManagers": [
-        "dockerfile"
-      ],
-      "matchPackageNames": [
-        "node",
-        "python"
-      ],
-      "matchUpdateTypes": [
-        "major"
-      ],
-      "enabled": false
-    },
-    {
       "matchManagers": [
         "github-actions"
       ],
       "groupName": "GitHub Actions"
     }
+  ],
+  "description": [
+    "Mises à jour fusionnées automatiquement par Renovate quand tous les tests CI (lint, OAuth, e2e arm64, builds) sont verts, puis appliquées sur le serveur par le service updater. platformAutomerge est désactivé : sans protection de branche, l'auto-merge GitHub fusionnerait avant la fin des tests."
   ]
 }
