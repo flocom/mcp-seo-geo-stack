@@ -164,6 +164,18 @@ TOOL_CALL='{"name":"get_account_summaries","arguments":{}}' TOOL_EXPECT='invalid
   node tests/mcp-smoke.mjs "$GATE/ga4/mcp" 8 run_report || fail "ga4 MCP"
 ok "ga4 (through the gate): MCP handshake, tools/list, same Google credentials loaded"
 
+echo "== 50 simultaneous connections (shared MCP processes, memory bounded)"
+TOOL_CALL='{"name":"sites_list","arguments":{"engine":"bing"}}' \
+  node tests/mcp-load.mjs "$GATE/gsc-bing/mcp" 50 || fail "gsc-bing under 50 concurrent sessions"
+node tests/mcp-load.mjs "$GATE/ga4/mcp" 50 || fail "ga4 under 50 concurrent sessions"
+for svc in gsc-bing ga4; do
+  n=$("${DC[@]}" exec -T "$svc" sh -c 'ls /proc | grep -c "^[0-9]"')
+  [[ "$n" -le 20 ]] || fail "$svc runs $n processes after 50 sessions (expected a few shared ones)"
+  mem=$(docker stats --no-stream --format '{{.MemUsage}}' "$(cid "$svc")")
+  echo "      $svc: $n processes, memory $mem"
+done
+ok "50 concurrent sessions per MCP server, served by a few shared processes"
+
 echo "== Gate: no MCP access without a valid Cloudflare Access JWT"
 gate_code() { # path [header]
   curl -s -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \

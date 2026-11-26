@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Test of the MCP session cap in services/gate/gate.py (standard library + openssl).
 
-supergateway starts one MCP server process per session. The gate must keep at most
+The gate must keep at most
 GATE_MAX_SESSIONS sessions open per MCP server: a new session closes the least recently used
 idle one first (DELETE upstream), never a session with a request in flight, and is refused
 with 503 + Retry-After when every session is busy.
@@ -34,7 +34,7 @@ CALL = json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": 
 
 
 class FakeGateway(BaseHTTPRequestHandler):
-    """Like supergateway stateful: initialize opens a session, DELETE closes it, unknown id -> 404."""
+    """Like an MCP Streamable HTTP server: initialize opens a session, DELETE closes it, unknown id -> 404."""
 
     protocol_version = "HTTP/1.1"
     ids = itertools.count(1)

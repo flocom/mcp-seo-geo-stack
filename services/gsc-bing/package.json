@@ -1,10 +1,9 @@
 {
   "name": "mcp-seo-geo-stack-gsc-bing",
   "private": true,
-  "description": "Google Search Console + Bing Webmaster (search-console-mcp) servi en Streamable HTTP par supergateway",
+  "description": "Google Search Console + Bing Webmaster (search-console-mcp), servi en Streamable HTTP par services/mux",
   "license": "MIT",
   "dependencies": {
-    "search-console-mcp": "2.1.4",
-    "supergateway": "4.2.2"
+    "search-console-mcp": "2.1.4"
   }
 }

@@ -10,12 +10,11 @@ compte Google est déjà lié dans /setup, l'adresse du jeton doit être la mêm
 la requête n'atteint jamais le serveur MCP. Le jeton et les cookies ne sont pas transmis au
 serveur MCP. Les réponses (Streamable HTTP, SSE) sont relayées en continu.
 
-Plafond de sessions : supergateway (mode stateful) lance un processus serveur MCP par session
-(~180 Mo pour search-console-mcp) et le garde jusqu'à expiration. Sans limite, des connexions
-répétées ou parallèles épuisent la mémoire du serveur, et cloudflared tombe avec le reste
-(erreur Cloudflare 1033). La passerelle suit donc les sessions ouvertes par serveur MCP : au-delà
-de GATE_MAX_SESSIONS, une nouvelle session (initialize) ferme d'abord la plus ancienne session
-inactive (DELETE vers supergateway, qui arrête son processus). Le client de cette session reçoit
+Plafond de sessions : les sessions sont servies par quelques processus MCP partagés (services/mux),
+elles coûtent peu, mais leur nombre reste borné pour que des clients qui ne ferment jamais leurs
+sessions ne s'accumulent pas. La passerelle suit les sessions ouvertes par serveur MCP : au-delà
+de GATE_MAX_SESSIONS (100 par défaut), une nouvelle session (initialize) ferme d'abord la plus
+ancienne session inactive (DELETE vers le serveur MCP). Le client de cette session reçoit
 404 à sa requête suivante et en ouvre une nouvelle, comme le prévoit la spécification MCP. Si
 toutes les sessions ont une requête en cours, la nouvelle est refusée (503, Retry-After).
 
@@ -55,7 +54,7 @@ def parse_routes(spec: str) -> list[tuple[str, str, int]]:
 
 
 ROUTES = parse_routes(os.environ.get("GATE_ROUTES", "/gsc-bing/=gsc-bing:8000,/ga4/=ga4:8000"))
-MAX_SESSIONS = max(1, int(os.environ.get("GATE_MAX_SESSIONS") or "6"))
+MAX_SESSIONS = max(1, int(os.environ.get("GATE_MAX_SESSIONS") or "100"))
 
 
 class Sessions:
@@ -256,7 +255,7 @@ class Gate(BaseHTTPRequestHandler):
             upstream.close()
 
     def _close_session(self, host: str, port: int, sid: str) -> None:
-        """Ferme une session côté supergateway, qui arrête son processus serveur MCP."""
+        """Ferme une session côté serveur MCP (DELETE, comme le ferait le client)."""
         conn = http.client.HTTPConnection(host, port, timeout=10)
         try:
             conn.request("DELETE", self.path.split("?", 1)[0], headers={"Mcp-Session-Id": sid, "Host": f"{host}:{port}"})

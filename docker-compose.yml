@@ -47,8 +47,8 @@ services:
     image: ${IMAGE_PREFIX:-mcp-seo-geo-stack}/gate:${IMAGE_TAG:-latest}
     environment:
       <<: *access
-      # Sessions MCP ouvertes au plus par serveur (un processus de ~150-200 Mo chacune).
-      GATE_MAX_SESSIONS: ${GATE_MAX_SESSIONS:-6}
+      # Sessions MCP ouvertes au plus par serveur MCP (la plus ancienne inactive est fermée au-delà).
+      GATE_MAX_SESSIONS: ${GATE_MAX_SESSIONS:-100}
     volumes:
       - seo-data:/data:ro
     networks: [mcp, backend]
@@ -64,6 +64,13 @@ services:
     # cloudflared ni le serveur (sinon : erreur Cloudflare 1033, tunnel injoignable).
     mem_limit: ${MCP_MEM_LIMIT:-1536m}
     pids_limit: 512
+    environment: &mux
+      # Processus serveur MCP partagés par toutes les sessions (voir services/mux/mux.mjs).
+      MUX_BACKENDS: ${MUX_BACKENDS:-2}
+      MUX_MAX_SESSIONS: ${MUX_MAX_SESSIONS:-200}
+      MUX_SESSION_IDLE_MS: ${MUX_SESSION_IDLE_MS:-1800000}
+      MUX_REQUEST_TIMEOUT_MS: ${MUX_REQUEST_TIMEOUT_MS:-300000}
+      MUX_DEBUG: ${MUX_DEBUG:-0}
     volumes:
       - seo-data:/data:ro
     depends_on: [setup]
@@ -81,6 +88,7 @@ services:
     # cloudflared ni le serveur (sinon : erreur Cloudflare 1033, tunnel injoignable).
     mem_limit: ${MCP_MEM_LIMIT:-1536m}
     pids_limit: 512
+    environment: *mux
     volumes:
       - seo-data:/data:ro
     depends_on: [setup]

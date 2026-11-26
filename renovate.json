@@ -53,13 +53,6 @@
       ]
     },
     {
-      "description": "supergateway est présent dans deux services : une seule PR",
-      "matchPackageNames": [
-        "supergateway"
-      ],
-      "groupName": "supergateway"
-    },
-    {
       "description": "Images de base : grouper les mises à jour mineures et correctives",
       "matchManagers": [
         "dockerfile",

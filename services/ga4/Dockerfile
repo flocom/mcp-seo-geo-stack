@@ -1,14 +1,16 @@
 # syntax=docker/dockerfile:1
 # Google Analytics 4 : serveur MCP officiel de Google (PyPI analytics-mcp),
 # lancé en stdio avec les identifiants "authorized_user" partagés, et exposé
-# en Streamable HTTP par supergateway sur /ga4/mcp.
+# en Streamable HTTP par le multiplexeur services/mux sur /ga4/mcp :
+# quelques processus analytics-mcp partagés par toutes les sessions.
 # Image linux/arm64 uniquement.
 
-# --- supergateway (Node) -----------------------------------------------------
-FROM node:24-trixie-slim AS gateway
-WORKDIR /opt/gateway
-COPY services/ga4/package.json services/ga4/package-lock.json ./
+# --- multiplexeur MCP (Node) -------------------------------------------------
+FROM node:24-trixie-slim AS mux
+WORKDIR /opt/mux
+COPY services/mux/package.json services/mux/package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+COPY services/mux/mux.mjs ./
 
 # --- analytics-mcp (Python) --------------------------------------------------
 FROM python:3.13-slim-trixie
@@ -27,8 +29,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libstdc++6 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=gateway /usr/local/bin/node /usr/local/bin/node
-COPY --from=gateway /opt/gateway /opt/gateway
+COPY --from=mux /usr/local/bin/node /usr/local/bin/node
+COPY --from=mux /opt/mux /opt/mux
 
 COPY services/ga4/requirements.txt /tmp/requirements.txt
 RUN python -m venv /opt/venv \
@@ -42,11 +44,8 @@ USER 10001:10001
 
 EXPOSE 8000
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["node", "/opt/gateway/node_modules/supergateway/dist/index.js", \
-     "--stdio", "/opt/venv/bin/analytics-mcp", \
-     "--outputTransport", "streamableHttp", \
-     "--stateful", "--sessionTimeout", "600000", \
+CMD ["node", "/opt/mux/mux.mjs", \
      "--port", "8000", \
-     "--streamableHttpPath", "/ga4/mcp", \
-     "--healthEndpoint", "/ga4/healthz", \
-     "--logLevel", "none"]
+     "--path", "/ga4/mcp", \
+     "--health", "/ga4/healthz", \
+     "--", "/opt/venv/bin/analytics-mcp"]

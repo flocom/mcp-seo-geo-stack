@@ -19,8 +19,8 @@ Claude ──HTTPS──▶ Cloudflare Access (OAuth géré + DCR, politique = v
                  cloudflared ──┬──▶ setup:8080   /setup, /setup/callback        (vérifie le JWT Access)
                                └──▶ gate:8080    /gsc-bing/mcp, /ga4/mcp        (vérifie le JWT Access)
                                        │  réseau interne « backend » uniquement
-                                       ├──▶ gsc-bing:8000  (search-console-mcp 2.1.4 via supergateway 4.2.2)
-                                       └──▶ ga4:8000       (analytics-mcp 1.1.0 via supergateway 4.2.2)
+                                       ├──▶ gsc-bing:8000  (search-console-mcp 2.1.4 via mux, 2 processus partagés)
+                                       └──▶ ga4:8000       (analytics-mcp 1.1.0 via mux, 2 processus partagés)
 
 volume seo-data (/data) : setup.json (client OAuth, compte), google/authorized_user.json (refresh token), bing_api_key
 ```
@@ -29,8 +29,8 @@ volume seo-data (/data) : setup.json (client OAuth, compte), google/authorized_u
 |---|---|
 | `setup` | Page de configuration et flux OAuth web (redirection vers `https://<domaine>/setup/callback`). Écrit dans le volume. Python, bibliothèque standard uniquement. |
 | `gate` | Seul accès aux serveurs MCP. Vérifie le JWT Cloudflare Access de chaque requête, impose le compte Google lié dans `/setup`, puis relaie la requête en continu vers `gsc-bing` ou `ga4`. Python, bibliothèque standard uniquement. |
-| `gsc-bing` | Paquet npm `search-console-mcp`, exposé en Streamable HTTP par `supergateway` (mode stateful). |
-| `ga4` | Serveur officiel de Google, paquet PyPI `analytics-mcp`, exposé en Streamable HTTP par `supergateway`. |
+| `gsc-bing` | Paquet npm `search-console-mcp`, exposé en Streamable HTTP par `mux`, le multiplexeur du dépôt (`services/mux`). |
+| `ga4` | Serveur officiel de Google, paquet PyPI `analytics-mcp`, exposé en Streamable HTTP par `mux`. |
 | `cloudflared` | Tunnel sortant vers Cloudflare. |
 | `updater` | Mises à jour automatiques : interroge le dépôt GitHub toutes les 5 minutes, avance le clone du serveur, reconstruit ou télécharge les images et ne redémarre que ce qui a changé. |
 
@@ -42,8 +42,27 @@ volume seo-data (/data) : setup.json (client OAuth, compte), google/authorized_u
   2. ses clients DCR, ses codes et ses jetons sont gardés **en mémoire** : chaque redémarrage forcerait une nouvelle autorisation, et il faudrait un second consentement Google.
   
   Le service tourne donc en **stdio** avec `google.auth.default()`, qui lit le **même** fichier `authorized_user` que gsc-bing. Vous donnez **un seul consentement** Google pour les deux scopes `webmasters.readonly` et `analytics.readonly`.
+- **mux** (`services/mux/mux.mjs`) remplace supergateway 4.2.2, dont le mode stateful lançait un processus serveur MCP par session (~180 Mo chacun, gardé 30 minutes) et épuisait la mémoire du serveur sous la charge. mux lance 2 processus serveur MCP stdio par service (`MUX_BACKENDS`) et donne à chaque session Streamable HTTP son propre objet `Server` du SDK MCP, qui relaie les requêtes au processus le moins chargé, avec progression, annulation et délai maximal. C'est possible parce que search-console-mcp et analytics-mcp sont sans état côté client : mêmes identifiants pour tous et aucune requête du serveur vers le client (sampling, roots, elicitation). Un processus qui plante est relancé à la requête suivante sans fermer les sessions. Les données MCP ne sont jamais écrites dans les logs : mux n'en journalise aucune et ignore la sortie d'erreur des serveurs MCP, sauf avec `MUX_DEBUG=1`.
 - **Redémarrage automatique** : après chaque modification sur `/setup`, l'app incrémente `/data/.version`. Le lanceur commun (`services/common/entrypoint.sh`) voit le changement, arrête le serveur MCP, et Docker relance le conteneur, qui relit les identifiants. Aucun accès au socket Docker n'est nécessaire pour cela.
 - Les conteneurs tournent en non-root (uid 10001), en lecture seule, sans capabilities. Les services MCP montent le volume en lecture seule, et ne sont joignables que par `gate`, sur un réseau Docker séparé.
+
+### Connexions simultanées et mémoire
+
+Avant, `supergateway` (mode stateful) lançait un processus serveur MCP par session HTTP (~180 Mo chacun pour `search-console-mcp`) et le gardait 30 minutes. Une rafale de connexions pouvait épuiser la mémoire du serveur et faire tomber `cloudflared` avec le reste (erreur Cloudflare `1033`).
+
+Désormais, `gsc-bing` et `ga4` font tourner `mux` (`services/mux/mux.mjs`, Node, dont la seule dépendance est `@modelcontextprotocol/sdk` 1.32.2, fixée dans `services/mux/package.json`). Il lance `MUX_BACKENDS` (2 par défaut) processus serveur MCP stdio partagés par service et sert autant de sessions Streamable HTTP qu'il faut par-dessus. Une session ne coûte que quelques Ko : c'est un objet `Server` du SDK qui relaie `tools/list`, `tools/call`, les prompts, les ressources et la complétion au processus le moins chargé, avec progression, annulation et délai maximal. Ce partage est sûr parce que `search-console-mcp` et `analytics-mcp` sont sans état côté client : toutes les sessions utilisent les mêmes identifiants, et les serveurs n'envoient aucune requête au client. Un processus qui plante est relancé à la requête suivante, et les sessions ouvertes continuent. Mesuré : 50 sessions simultanées (`initialize` + `tools/list` + `tools/call`) ont toutes abouti en 1 s environ, avec ~500 Mo de RSS au total, contre ~9 Go avec un processus par session. La pile tient 50 connexions simultanées et plus.
+
+Les chemins MCP et les points de santé (`/gsc-bing/healthz`, `/ga4/healthz`) ne changent pas. Les réglages se font dans `.env` (voir `.env.example`) :
+
+| Variable | Défaut | Effet |
+|---|---|---|
+| `GATE_MAX_SESSIONS` | `100` | Sessions par serveur MCP acceptées par `gate`. Au-delà, la session inactive utilisée le moins récemment est fermée ; une session occupée ne l'est jamais. Si toutes sont occupées : `503` avec `Retry-After`. |
+| `MUX_BACKENDS` | `2` | Processus serveur MCP partagés par service. |
+| `MUX_MAX_SESSIONS` | `200` | Sessions gardées ouvertes par `mux` ; au-delà, la plus ancienne inactive est fermée. |
+| `MUX_SESSION_IDLE_MS` | `1800000` (30 min) | Une session sans requête pendant ce délai est fermée. |
+| `MUX_REQUEST_TIMEOUT_MS` | `300000` (5 min) | Durée maximale d'une requête relayée, remise à zéro à chaque progression. |
+| `MUX_DEBUG` | désactivé | `1` recopie la sortie d'erreur des serveurs MCP dans les logs. Désactivé par défaut pour que les données MCP (vos données SEO) n'arrivent jamais dans les logs Docker. |
+| `MCP_MEM_LIMIT` | `1536m` | Plafond mémoire (`mem_limit`) des conteneurs `gsc-bing` et `ga4`. |
 
 ---
 
@@ -168,7 +187,7 @@ PR Renovate ──▶ CI arm64 (lint, flux OAuth, e2e Docker, builds) ──▶ 
                                  ──▶ build (ou pull depuis GHCR) ──▶ docker compose up -d
 ```
 
-- **Versions fixées** : `services/gsc-bing/package.json` et `package-lock.json` (search-console-mcp, supergateway), `services/ga4/requirements.txt` (analytics-mcp), images de base dans les Dockerfile, `cloudflared` dans `docker-compose.yml`. Les images de base sont aussi fixées par digest : même une reconstruction de sécurité en amont arrive sous forme de PR testée.
+- **Versions fixées** : `services/gsc-bing/package.json` et `package-lock.json` (search-console-mcp), `services/mux/package.json` (SDK MCP), `services/ga4/requirements.txt` (analytics-mcp), images de base dans les Dockerfile, `cloudflared` dans `docker-compose.yml`. Les images de base sont aussi fixées par digest : même une reconstruction de sécurité en amont arrive sous forme de PR testée.
 - **Renovate** (`renovate.json`) ouvre des PR pour npm, PyPI, les images Docker et les actions GitHub, avec une PR dédiée pour chaque serveur MCP, et **les fusionne automatiquement quand tous les tests sont verts**. Un test rouge bloque la fusion : la PR vous attend. Une nouvelle version npm ou PyPI n'est proposée qu'après 3 jours, une protection classique contre les paquets compromis. Activez l'app [Renovate](https://github.com/apps/renovate) sur le dépôt.
 - **GitHub Actions** (`.github/workflows/build.yml`) construit les quatre images **linux/arm64 nativement** sur un runner `ubuntu-24.04-arm`, sans QEMU ni multi-arch. Les PR (y compris celles de Renovate) sont construites sans être publiées. Sur `main`, les images sont poussées vers `ghcr.io/flocom/mcp-seo-geo-stack/<service>:latest` et `:sha-xxxxxxx`.
 - **Le service `updater`** interroge le dépôt toutes les 5 minutes (`UPDATE_INTERVAL` dans `.env`, en secondes). Quand `main` a avancé, il avance le clone en fast-forward, puis :
@@ -213,7 +232,7 @@ docker run --rm -v mcp-seo-geo-stack_seo-data:/data:ro -v "$PWD":/out alpine tar
 | Erreur 403 « API has not been used » | Activez l'API indiquée dans le projet Google Cloud du client OAuth. |
 | Le jeton expire au bout de 7 jours | L'écran de consentement est resté en mode « Test » : publiez-le en production, puis reconnectez-vous. |
 | Outils d'écriture ou d'indexation de search-console-mcp en erreur | Normal : seuls les scopes en lecture seule sont demandés. |
-| Erreur Cloudflare `1033` (tunnel injoignable), connecteurs qui tombent quand plusieurs requêtes partent en même temps | Le serveur a manqué de mémoire et `cloudflared` est tombé avec le reste : supergateway lance un processus serveur MCP (~150-200 Mo) par session. La passerelle plafonne désormais les sessions par serveur MCP (`GATE_MAX_SESSIONS`, 6 par défaut : la session inactive la plus ancienne est fermée d'abord) et chaque conteneur MCP a un plafond mémoire (`MCP_MEM_LIMIT`, `1536m` par défaut). Vérifiez avec `docker compose ps`, `docker stats --no-stream` et `sudo dmesg -T \| grep -i oom`. Baissez `GATE_MAX_SESSIONS` sur une petite instance. |
+| Erreur Cloudflare `1033` (tunnel injoignable), connecteurs qui tombent quand plusieurs requêtes partent en même temps | Le serveur a manqué de mémoire et `cloudflared` est tombé avec le reste. La cause était `supergateway`, qui lançait un processus serveur MCP (~180 Mo) par session. Il est remplacé par `mux`, qui sert toutes les sessions avec 2 processus partagés par service (voir [Connexions simultanées et mémoire](#connexions-simultanées-et-mémoire)) : 50 sessions occupent ~500 Mo au total. `gate` accepte `GATE_MAX_SESSIONS` sessions par serveur MCP (100 par défaut) et chaque conteneur MCP a un plafond mémoire (`MCP_MEM_LIMIT`, `1536m` par défaut). Vérifiez que le serveur tourne sur la version actuelle, puis contrôlez avec `docker compose ps`, `docker stats --no-stream` et `sudo dmesg -T \| grep -i oom`. Sur une toute petite instance, baissez `GATE_MAX_SESSIONS` ou `MUX_BACKENDS`. |
 | Les mises à jour ne s'appliquent plus | Consultez `docker compose logs updater`. « fast-forward impossible » signifie que des fichiers suivis ont été modifiés sur le serveur ou que la branche a divergé : `git status`, puis `git stash` ou `git reset --hard origin/main`. |
 
 ## Arborescence
@@ -224,13 +243,14 @@ docker run --rm -v mcp-seo-geo-stack_seo-data:/data:ro -v "$PWD":/out alpine tar
 ├── .env.example
 ├── renovate.json
 ├── .github/workflows/{build.yml,test.yml}
-├── tests/{test_setup_flow.py,mcp-smoke.mjs,e2e.sh,updater-e2e.sh}
+├── tests/{test_setup_flow.py,test_gate.py,test_gate_sessions.py,test_mux.mjs,fake-mcp-server.mjs,mcp-smoke.mjs,mcp-load.mjs,e2e.sh,updater-e2e.sh}
 └── services/
     ├── common/entrypoint.sh      # attente de la config + redémarrage sur changement
     ├── common/access_jwt.py      # vérification des JWT Cloudflare Access
     ├── setup/{Dockerfile,app.py}
     ├── gate/{Dockerfile,gate.py} # passerelle d'authentification devant les serveurs MCP
+    ├── mux/{package.json,mux.mjs} # multiplexeur : de nombreuses sessions MCP, 2 processus serveur MCP partagés
     ├── gsc-bing/{Dockerfile,package.json,package-lock.json}
-    ├── ga4/{Dockerfile,requirements.txt,package.json,package-lock.json}
+    ├── ga4/{Dockerfile,requirements.txt}
     └── updater/{Dockerfile,updater.sh}   # mises à jour automatiques
 ```
