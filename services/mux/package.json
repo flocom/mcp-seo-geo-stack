@@ -1,0 +1,10 @@
+{
+  "name": "mcp-seo-geo-stack-mux",
+  "private": true,
+  "description": "Multiplexeur : de nombreuses sessions MCP Streamable HTTP servies par quelques processus serveur MCP stdio partagés",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2"
+  }
+}

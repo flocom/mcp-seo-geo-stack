@@ -30,9 +30,9 @@ jobs:
             echo "::endgroup::"
           done
       - name: Python syntax
-        run: python3 -m py_compile services/common/access_jwt.py services/setup/app.py services/gate/gate.py tests/access_token.py tests/test_setup_flow.py tests/test_gate.py
+        run: python3 -m py_compile services/common/access_jwt.py services/setup/app.py services/gate/gate.py tests/access_token.py tests/test_setup_flow.py tests/test_gate.py tests/test_gate_sessions.py
       - name: Node syntax
-        run: node --check tests/mcp-smoke.mjs
+        run: for f in tests/mcp-smoke.mjs tests/mcp-load.mjs tests/test_mux.mjs tests/fake-mcp-server.mjs services/mux/mux.mjs; do node --check "$f"; done
       - name: Renovate config
         run: npx --yes --package renovate -- renovate-config-validator --strict renovate.json
 
@@ -49,6 +49,14 @@ jobs:
         run: python tests/test_setup_flow.py
       - name: Gate in front of the MCP servers (Access JWT, streaming)
         run: python tests/test_gate.py
+      - name: Gate session cap
+        run: python tests/test_gate_sessions.py
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - name: MCP multiplexer (50 sessions on 2 shared processes, progress, cancel, crash)
+        working-directory: services/mux
+        run: npm ci --ignore-scripts --no-audit --no-fund && node ../../tests/test_mux.mjs
 
   e2e:
     runs-on: ubuntu-24.04-arm

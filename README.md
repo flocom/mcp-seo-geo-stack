@@ -34,8 +34,8 @@ Claude ──HTTPS──▶ Cloudflare Access (Managed OAuth + DCR, policy = you
                  cloudflared ──┬──▶ setup:8080   /setup, /setup/callback        (verifies the Access JWT)
                                └──▶ gate:8080    /gsc-bing/mcp, /ga4/mcp        (verifies the Access JWT)
                                        │  internal "backend" network only
-                                       ├──▶ gsc-bing:8000  (search-console-mcp 2.1.4 via supergateway 4.2.2)
-                                       └──▶ ga4:8000       (analytics-mcp 1.1.0 via supergateway 4.2.2)
+                                       ├──▶ gsc-bing:8000  (search-console-mcp 2.1.4 via mux, 2 shared processes)
+                                       └──▶ ga4:8000       (analytics-mcp 1.1.0 via mux, 2 shared processes)
 
 volume seo-data (/data): setup.json (OAuth client, account), google/authorized_user.json (refresh token), bing_api_key
 ```
@@ -44,10 +44,28 @@ volume seo-data (/data): setup.json (OAuth client, account), google/authorized_u
 |---|---|
 | `setup` | Configuration page and web OAuth flow, with Google redirecting to `https://<domain>/setup/callback`. Writes credentials to the volume. Python, standard library only. |
 | `gate` | The only way to the MCP servers. Verifies the Cloudflare Access JWT on every request, enforces the Google account linked in `/setup`, then streams the request to `gsc-bing` or `ga4`. Python, standard library only. |
-| `gsc-bing` | The npm package [`search-console-mcp`](https://www.npmjs.com/package/search-console-mcp) (Google Search Console + Bing Webmaster Tools), exposed as Streamable HTTP by [`supergateway`](https://www.npmjs.com/package/supergateway). |
-| `ga4` | Google's official GA4 MCP server, the PyPI package [`analytics-mcp`](https://pypi.org/project/analytics-mcp/), exposed as Streamable HTTP by `supergateway`. |
+| `gsc-bing` | The npm package [`search-console-mcp`](https://www.npmjs.com/package/search-console-mcp) (Google Search Console + Bing Webmaster Tools), exposed as Streamable HTTP by `mux`, the in-repo multiplexer (`services/mux`). |
+| `ga4` | Google's official GA4 MCP server, the PyPI package [`analytics-mcp`](https://pypi.org/project/analytics-mcp/), exposed as Streamable HTTP by `mux`. |
 | `cloudflared` | Outbound Cloudflare Tunnel. Nothing listens on the host. |
 | `updater` | Automatic updates: checks the GitHub repository every 5 minutes, fast-forwards the server checkout, rebuilds or pulls the images and restarts only what changed. |
+
+## Concurrency and memory
+
+Before, `supergateway` (stateful mode) started one MCP server process per HTTP session (~180 MB each for `search-console-mcp`) and kept it for 30 minutes. A burst of connections could exhaust the server's memory and take `cloudflared` down with it (Cloudflare error `1033`).
+
+Now `gsc-bing` and `ga4` run `mux` (`services/mux/mux.mjs`, Node, whose only dependency is `@modelcontextprotocol/sdk` 1.32.2, pinned in `services/mux/package.json`). It starts `MUX_BACKENDS` (default 2) shared stdio MCP server processes per service and serves any number of Streamable HTTP sessions on top of them. A session costs a few KB: it is an SDK `Server` object that relays `tools/list`, `tools/call`, prompts, resources and completion to the least busy process, with progress notifications, cancellation and a timeout. Sharing is safe because `search-console-mcp` and `analytics-mcp` hold no per-client state: every session uses the same credentials, and the servers never send requests to the client. A process that crashes is restarted on the next request, and open sessions survive. Measured: 50 concurrent sessions (`initialize` + `tools/list` + `tools/call`) all succeeded in about 1 s with ~500 MB RSS in total, versus ~9 GB with one process per session. The stack handles 50+ simultaneous connections.
+
+MCP paths and health endpoints (`/gsc-bing/healthz`, `/ga4/healthz`) are unchanged. Settings go in `.env` (see `.env.example`):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `GATE_MAX_SESSIONS` | `100` | Sessions per MCP server allowed by `gate`. Beyond it, the least recently used idle session is closed; busy sessions never are. If all are busy, `503` with `Retry-After`. |
+| `MUX_BACKENDS` | `2` | Shared MCP server processes per service. |
+| `MUX_MAX_SESSIONS` | `200` | Sessions kept open by `mux`; beyond it, the oldest idle one is closed. |
+| `MUX_SESSION_IDLE_MS` | `1800000` (30 min) | A session with no request for this long is closed. |
+| `MUX_REQUEST_TIMEOUT_MS` | `300000` (5 min) | Maximum duration of a relayed request, reset on each progress notification. |
+| `MUX_DEBUG` | off | `1` copies MCP server stderr to the logs. Off by default so MCP payloads (your SEO data) never reach Docker logs. |
+| `MCP_MEM_LIMIT` | `1536m` | Memory limit (`mem_limit`) of the `gsc-bing` and `ga4` containers. |
 
 ---
 
@@ -180,7 +198,7 @@ Only read-only scopes are requested. Write and indexing tools return an authoriz
 - **Identity**: Cloudflare Access protects every path, with a single-email policy. `setup` and `gate` independently verify the signed Access JWT (signature, issuer, AUD, expiry) on every request, so a forged header, a token from another team or application, or an expired token is refused, even if a route were published without Access. Once a Google account is linked, only that email gets through `gate`.
 - **Secrets**: they live only in `.env` (tunnel token; the Access team domain and AUD are not secret) and in the `mcp-seo-geo-stack_seo-data` volume, with files at mode `0600`. Secrets are excluded from git (`.gitignore`) and from the build context (`.dockerignore`), so they never end up in an image.
 - **Containers**: non-root (uid 10001), `read_only`, `cap_drop: ALL`, `no-new-privileges`. MCP services mount the volume read-only.
-- **Logs**: supergateway runs with `--logLevel none`, so MCP payloads (your SEO data) are not written to Docker logs.
+- **Logs**: `mux` never logs MCP payloads (your SEO data), and it drops the MCP servers' stderr unless `MUX_DEBUG=1`, so none of it reaches Docker logs.
 - **OAuth**: PKCE, a random `state`, a CSRF token on every form, and revocation from `/setup`.
 - **Updater**: it mounts the Docker socket, which is equivalent to root on the host, so that it can redeploy the stack. It runs on its own network with no access to the MCP services, without capabilities other than `SETUID`/`SETGID` (to run git as the owner of the checkout), and it only deploys what is merged into the repository's `main` branch. Anyone who can push to that branch can change what runs on your server: protect it accordingly, or set `UPDATE_INTERVAL=0` to turn automatic updates off.
 
@@ -195,7 +213,7 @@ Renovate PR ──▶ CI on arm64 (lint, OAuth flow, Docker e2e, image builds) �
                                           ──▶ build (or pull from GHCR) ──▶ docker compose up -d
 ```
 
-- **Pinned versions** live in `services/gsc-bing/package.json` and `package-lock.json`, `services/ga4/requirements.txt`, the Dockerfiles, and the `cloudflared` image tag. Base images are also pinned by digest, so even an upstream security rebuild arrives as a tested pull request.
+- **Pinned versions** live in `services/gsc-bing/package.json` and `package-lock.json`, `services/mux/package.json` and `package-lock.json`, `services/ga4/requirements.txt`, the Dockerfiles, and the `cloudflared` image tag. Base images are also pinned by digest, so even an upstream security rebuild arrives as a tested pull request.
 - **Renovate** (`renovate.json`) opens pull requests for npm, PyPI, Docker and GitHub Actions, with a dedicated PR for each MCP server, and **merges them automatically once every check is green**. A red check blocks the merge, and the PR waits for you. New npm and PyPI releases must be 3 days old before they are proposed, a common guard against compromised packages. Install the [Renovate GitHub app](https://github.com/apps/renovate) on your repository (or fork) to turn this on.
 - **GitHub Actions** (`build.yml`) builds the four images **natively on `ubuntu-24.04-arm`** and pushes them to `ghcr.io/flocom/mcp-seo-geo-stack/<service>` with the tags `latest` and `sha-<commit>`. Pull requests are built but not published.
 - **The `updater` service** on the server checks the repository every 5 minutes (`UPDATE_INTERVAL` in `.env`, in seconds). When `main` has moved, it fast-forwards the checkout, then:
@@ -221,6 +239,8 @@ git pull && docker compose up -d --build
 |---|---|---|
 | `tests/test_setup_flow.py` | The full `/setup` OAuth flow against a mock Google: Access JWT verification (forged header, foreign key, expired, wrong audience or issuer, `alg: none`, tampered payload), CSRF, PKCE, state, account matching, file permissions, revocation | `python3 tests/test_setup_flow.py` |
 | `tests/test_gate.py` | The gate against a fake MCP server: no request gets through without a valid JWT, JWT and cookies not forwarded, linked-account lock, SSE streaming | `python3 tests/test_gate.py` |
+| `tests/test_gate_sessions.py` | Session cap: least recently used idle session closed first, busy sessions never closed, `503` when all are busy | `python3 tests/test_gate_sessions.py` |
+| `tests/test_mux.mjs` | The multiplexer: 50 concurrent sessions served by 2 shared processes, progress relayed, cancellation, crash and restart, `404` for an unknown session, session cap | `cd services/mux && npm ci && node ../../tests/test_mux.mjs` |
 | `tests/mcp-smoke.mjs` | MCP over Streamable HTTP: `initialize`, `tools/list`, and an optional `tools/call` | `node tests/mcp-smoke.mjs <url>` |
 | `tests/e2e.sh` | The full Docker stack on an arm64 runner: images, wait-for-config, credential reload, both MCP endpoints | `bash tests/e2e.sh` |
 | `tests/updater-e2e.sh` | Automatic updates against a local git origin: new commit deployed (updater included), data kept, broken commit harmless, no root-owned files | `bash tests/updater-e2e.sh` |
@@ -245,6 +265,7 @@ docker run --rm -v mcp-seo-geo-stack_seo-data:/data:ro -v "$PWD":/out alpine tar
 | "No refresh token" | Remove the app at myaccount.google.com/permissions, then reconnect. |
 | `403 API has not been used` | Enable that API in the OAuth client's Google Cloud project. |
 | Token expires after 7 days | The consent screen is still in "Testing". Publish it to production and reconnect. |
+| Cloudflare error `1033` (tunnel unreachable), connectors drop when several requests run at once | The server ran out of memory and took `cloudflared` down. This came from `supergateway`, which started one MCP server process (~180 MB) per session. It is replaced by `mux`, which serves every session from 2 shared processes per service (see [Concurrency and memory](#concurrency-and-memory)): 50 sessions use ~500 MB in total. `gate` allows `GATE_MAX_SESSIONS` (default 100) sessions per MCP server and each MCP container has a memory limit (`MCP_MEM_LIMIT`, default `1536m`). Make sure the server runs the current version, then check with `docker compose ps`, `docker stats --no-stream` and `sudo dmesg -T \| grep -i oom`. On a very small instance, lower `GATE_MAX_SESSIONS` or `MUX_BACKENDS`. |
 | Updates are no longer applied | Check `docker compose logs updater`. "fast-forward impossible" means tracked files were edited on the server or the branch diverged: run `git status`, then `git stash` or `git reset --hard origin/main`. |
 
 ## FAQ
@@ -281,7 +302,7 @@ The `genai_query_insights` tool flags queries that look like AI-assisted or conv
 - **search-console-mcp 2.1.4**: its built-in `setup` starts a server on `127.0.0.1`, which is unusable on a headless server. It does read `GOOGLE_APPLICATION_CREDENTIALS` and passes it to `google.auth.GoogleAuth({ keyFilename })`, and google-auth-library accepts an **`authorized_user`** file (client_id, client_secret, refresh_token). It reads `BING_API_KEY` for Bing. Calls to `@napi-rs/keyring` sit inside `try/catch`, so there is **no hard dependency on an OS keychain**. Its encrypted config file (`~/.search-console-mcp-config.enc`) is not used here.
 - **analytics-mcp 1.1.0**: in stdio mode it uses `google.auth.default()`, which loads the **same** `authorized_user` file.
 - **Automatic reload**: after each change, `/setup` bumps `/data/.version`. The shared launcher (`services/common/entrypoint.sh`) sees it, stops the MCP server, and Docker restarts the container (`restart: unless-stopped`). No Docker socket is needed for this.
-- **supergateway 4.2.2** runs in stateful Streamable HTTP mode, with one MCP child process per session and a 30-minute session timeout.
+- **mux** (`services/mux/mux.mjs`) replaces supergateway 4.2.2, whose stateful mode started one MCP child process per session (~180 MB each, kept 30 minutes) and exhausted the server's memory under load. mux starts 2 stdio MCP server processes per service (`MUX_BACKENDS`) and gives each Streamable HTTP session its own MCP SDK `Server` object, which relays requests to the least busy process with progress, cancellation and a timeout. This works because search-console-mcp and analytics-mcp are stateless per client: same credentials for everyone and no server-to-client requests (sampling, roots, elicitation). A crashed process is restarted on the next request without closing sessions.
 
 ## Project layout
 
@@ -291,14 +312,15 @@ The `genai_query_insights` tool flags queries that look like AI-assisted or conv
 ├── .env.example
 ├── renovate.json
 ├── .github/workflows/{build.yml,test.yml}
-├── tests/{test_setup_flow.py,mcp-smoke.mjs,e2e.sh,updater-e2e.sh}
+├── tests/{test_setup_flow.py,test_gate.py,test_gate_sessions.py,test_mux.mjs,fake-mcp-server.mjs,mcp-smoke.mjs,mcp-load.mjs,e2e.sh,updater-e2e.sh}
 └── services/
     ├── common/entrypoint.sh      # wait for config + restart on change
     ├── common/access_jwt.py      # Cloudflare Access JWT verification
     ├── setup/{Dockerfile,app.py}
     ├── gate/{Dockerfile,gate.py} # auth gateway in front of the MCP servers
+    ├── mux/{package.json,mux.mjs} # multiplexer: many MCP sessions, 2 shared MCP server processes
     ├── gsc-bing/{Dockerfile,package.json,package-lock.json}
-    ├── ga4/{Dockerfile,requirements.txt,package.json,package-lock.json}
+    ├── ga4/{Dockerfile,requirements.txt}
     └── updater/{Dockerfile,updater.sh}   # automatic updates
 ```
 

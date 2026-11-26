@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1
 # Google Search Console + Bing Webmaster Tools (paquet npm search-console-mcp),
-# exposé en Streamable HTTP par supergateway sur /gsc-bing/mcp.
+# exposé en Streamable HTTP par le multiplexeur services/mux sur /gsc-bing/mcp :
+# quelques processus search-console-mcp partagés par toutes les sessions.
 # Image linux/arm64 uniquement (construite nativement sur l'Oracle ou un runner ARM).
 FROM node:24-trixie-slim
 
@@ -16,6 +17,13 @@ COPY services/gsc-bing/package.json services/gsc-bing/package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
     && npm cache clean --force
 
+WORKDIR /opt/mux
+COPY services/mux/package.json services/mux/package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && npm cache clean --force
+COPY services/mux/mux.mjs ./
+WORKDIR /app
+
 COPY --chmod=755 services/common/entrypoint.sh /usr/local/bin/entrypoint.sh
 
 # /data appartient à l'utilisateur non root : un volume nommé neuf hérite de ces droits.
@@ -24,11 +32,8 @@ USER 10001:10001
 
 EXPOSE 8000
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["node", "/app/node_modules/supergateway/dist/index.js", \
-     "--stdio", "node /app/node_modules/search-console-mcp/dist/index.js", \
-     "--outputTransport", "streamableHttp", \
-     "--stateful", "--sessionTimeout", "1800000", \
+CMD ["node", "/opt/mux/mux.mjs", \
      "--port", "8000", \
-     "--streamableHttpPath", "/gsc-bing/mcp", \
-     "--healthEndpoint", "/gsc-bing/healthz", \
-     "--logLevel", "none"]
+     "--path", "/gsc-bing/mcp", \
+     "--health", "/gsc-bing/healthz", \
+     "--", "node", "/app/node_modules/search-console-mcp/dist/index.js"]
