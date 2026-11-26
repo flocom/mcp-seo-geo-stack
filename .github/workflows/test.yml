@@ -30,7 +30,7 @@ jobs:
             echo "::endgroup::"
           done
       - name: Python syntax
-        run: python3 -m py_compile services/common/access_jwt.py services/setup/app.py services/gate/gate.py tests/access_token.py tests/test_setup_flow.py tests/test_gate.py
+        run: python3 -m py_compile services/common/access_jwt.py services/setup/app.py services/gate/gate.py tests/access_token.py tests/test_setup_flow.py tests/test_gate.py tests/test_gate_sessions.py
       - name: Node syntax
         run: node --check tests/mcp-smoke.mjs
       - name: Renovate config
@@ -49,6 +49,8 @@ jobs:
         run: python tests/test_setup_flow.py
       - name: Gate in front of the MCP servers (Access JWT, streaming)
         run: python tests/test_gate.py
+      - name: Gate session cap (one MCP server process per session)
+        run: python tests/test_gate_sessions.py
 
   e2e:
     runs-on: ubuntu-24.04-arm

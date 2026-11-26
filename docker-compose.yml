@@ -45,7 +45,10 @@ services:
       dockerfile: services/gate/Dockerfile
       platforms: [linux/arm64]
     image: ${IMAGE_PREFIX:-mcp-seo-geo-stack}/gate:${IMAGE_TAG:-latest}
-    environment: *access
+    environment:
+      <<: *access
+      # Sessions MCP ouvertes au plus par serveur (un processus de ~150-200 Mo chacune).
+      GATE_MAX_SESSIONS: ${GATE_MAX_SESSIONS:-6}
     volumes:
       - seo-data:/data:ro
     networks: [mcp, backend]
@@ -57,6 +60,10 @@ services:
       dockerfile: services/gsc-bing/Dockerfile
       platforms: [linux/arm64]
     image: ${IMAGE_PREFIX:-mcp-seo-geo-stack}/gsc-bing:${IMAGE_TAG:-latest}
+    # Plafond mémoire : un pic de sessions ne tue que des processus de ce conteneur, jamais
+    # cloudflared ni le serveur (sinon : erreur Cloudflare 1033, tunnel injoignable).
+    mem_limit: ${MCP_MEM_LIMIT:-1536m}
+    pids_limit: 512
     volumes:
       - seo-data:/data:ro
     depends_on: [setup]
@@ -70,6 +77,10 @@ services:
       dockerfile: services/ga4/Dockerfile
       platforms: [linux/arm64]
     image: ${IMAGE_PREFIX:-mcp-seo-geo-stack}/ga4:${IMAGE_TAG:-latest}
+    # Plafond mémoire : un pic de sessions ne tue que des processus de ce conteneur, jamais
+    # cloudflared ni le serveur (sinon : erreur Cloudflare 1033, tunnel injoignable).
+    mem_limit: ${MCP_MEM_LIMIT:-1536m}
+    pids_limit: 512
     volumes:
       - seo-data:/data:ro
     depends_on: [setup]

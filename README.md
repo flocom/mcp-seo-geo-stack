@@ -221,6 +221,7 @@ git pull && docker compose up -d --build
 |---|---|---|
 | `tests/test_setup_flow.py` | The full `/setup` OAuth flow against a mock Google: Access JWT verification (forged header, foreign key, expired, wrong audience or issuer, `alg: none`, tampered payload), CSRF, PKCE, state, account matching, file permissions, revocation | `python3 tests/test_setup_flow.py` |
 | `tests/test_gate.py` | The gate against a fake MCP server: no request gets through without a valid JWT, JWT and cookies not forwarded, linked-account lock, SSE streaming | `python3 tests/test_gate.py` |
+| `tests/test_gate_sessions.py` | Session cap: least recently used idle session closed first, busy sessions never closed, `503` when all are busy | `python3 tests/test_gate_sessions.py` |
 | `tests/mcp-smoke.mjs` | MCP over Streamable HTTP: `initialize`, `tools/list`, and an optional `tools/call` | `node tests/mcp-smoke.mjs <url>` |
 | `tests/e2e.sh` | The full Docker stack on an arm64 runner: images, wait-for-config, credential reload, both MCP endpoints | `bash tests/e2e.sh` |
 | `tests/updater-e2e.sh` | Automatic updates against a local git origin: new commit deployed (updater included), data kept, broken commit harmless, no root-owned files | `bash tests/updater-e2e.sh` |
@@ -245,6 +246,7 @@ docker run --rm -v mcp-seo-geo-stack_seo-data:/data:ro -v "$PWD":/out alpine tar
 | "No refresh token" | Remove the app at myaccount.google.com/permissions, then reconnect. |
 | `403 API has not been used` | Enable that API in the OAuth client's Google Cloud project. |
 | Token expires after 7 days | The consent screen is still in "Testing". Publish it to production and reconnect. |
+| Cloudflare error `1033` (tunnel unreachable), connectors drop when several requests run at once | The server ran out of memory and took `cloudflared` down: supergateway starts one MCP server process (~150-200 MB) per session. The gate now caps sessions per MCP server (`GATE_MAX_SESSIONS`, default 6: the least recently used idle one is closed first) and each MCP container has a memory limit (`MCP_MEM_LIMIT`, default `1536m`). Check with `docker compose ps`, `docker stats --no-stream` and `sudo dmesg -T \| grep -i oom`. Lower `GATE_MAX_SESSIONS` on a small instance. |
 | Updates are no longer applied | Check `docker compose logs updater`. "fast-forward impossible" means tracked files were edited on the server or the branch diverged: run `git status`, then `git stash` or `git reset --hard origin/main`. |
 
 ## FAQ

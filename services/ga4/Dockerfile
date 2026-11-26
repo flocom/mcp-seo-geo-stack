@@ -45,7 +45,7 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["node", "/opt/gateway/node_modules/supergateway/dist/index.js", \
      "--stdio", "/opt/venv/bin/analytics-mcp", \
      "--outputTransport", "streamableHttp", \
-     "--stateful", "--sessionTimeout", "1800000", \
+     "--stateful", "--sessionTimeout", "600000", \
      "--port", "8000", \
      "--streamableHttpPath", "/ga4/mcp", \
      "--healthEndpoint", "/ga4/healthz", \

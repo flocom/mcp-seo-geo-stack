@@ -27,7 +27,7 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["node", "/app/node_modules/supergateway/dist/index.js", \
      "--stdio", "node /app/node_modules/search-console-mcp/dist/index.js", \
      "--outputTransport", "streamableHttp", \
-     "--stateful", "--sessionTimeout", "1800000", \
+     "--stateful", "--sessionTimeout", "600000", \
      "--port", "8000", \
      "--streamableHttpPath", "/gsc-bing/mcp", \
      "--healthEndpoint", "/gsc-bing/healthz", \

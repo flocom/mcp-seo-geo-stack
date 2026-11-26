@@ -213,6 +213,7 @@ docker run --rm -v mcp-seo-geo-stack_seo-data:/data:ro -v "$PWD":/out alpine tar
 | Erreur 403 « API has not been used » | Activez l'API indiquée dans le projet Google Cloud du client OAuth. |
 | Le jeton expire au bout de 7 jours | L'écran de consentement est resté en mode « Test » : publiez-le en production, puis reconnectez-vous. |
 | Outils d'écriture ou d'indexation de search-console-mcp en erreur | Normal : seuls les scopes en lecture seule sont demandés. |
+| Erreur Cloudflare `1033` (tunnel injoignable), connecteurs qui tombent quand plusieurs requêtes partent en même temps | Le serveur a manqué de mémoire et `cloudflared` est tombé avec le reste : supergateway lance un processus serveur MCP (~150-200 Mo) par session. La passerelle plafonne désormais les sessions par serveur MCP (`GATE_MAX_SESSIONS`, 6 par défaut : la session inactive la plus ancienne est fermée d'abord) et chaque conteneur MCP a un plafond mémoire (`MCP_MEM_LIMIT`, `1536m` par défaut). Vérifiez avec `docker compose ps`, `docker stats --no-stream` et `sudo dmesg -T \| grep -i oom`. Baissez `GATE_MAX_SESSIONS` sur une petite instance. |
 | Les mises à jour ne s'appliquent plus | Consultez `docker compose logs updater`. « fast-forward impossible » signifie que des fichiers suivis ont été modifiés sur le serveur ou que la branche a divergé : `git status`, puis `git stash` ou `git reset --hard origin/main`. |
 
 ## Arborescence
